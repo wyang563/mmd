@@ -1,0 +1,8 @@
+mmd.egg-info/
+data_trajectories/
+data_trained_models/
+scripts/inference/results/
+deps/
+results/
+**__pycache__**
+out.txt

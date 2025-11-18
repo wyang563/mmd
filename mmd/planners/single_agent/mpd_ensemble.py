@@ -128,7 +128,7 @@ class MPDEnsemble(SingleAgentPlanner):
         sample_kwargs = []
         contexts = None
         for j, model_id in enumerate(model_ids):
-            model_dir = os.path.join(TRAINED_MODELS_DIR, model_id)
+            model_dir = os.path.join(trained_models_dir, model_id)
             model_dirs.append(model_dir)
             args.append(load_params_from_yaml(os.path.join(model_dir, 'args.yaml')))
 

@@ -69,6 +69,7 @@ from mmd.config.mmd_params import MMDParams as params
 from mmd.common.experiments import MultiAgentPlanningSingleTrialConfig, MultiAgentPlanningSingleTrialResult, \
     get_result_dir_from_trial_config, TrialSuccessStatus
 from torch_robotics.environments import *
+from mmd.utils.plot_trajs import create_trajectory_gif
 
 allow_ops_in_compiled_graph()
 
@@ -80,8 +81,11 @@ device = 'cuda'
 device = get_torch_device(device)
 tensor_args = {'device': device, 'dtype': torch.float32}
 
-
-def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
+def run_horizon_step(
+    test_config,
+    horizon_start,
+    horizon_goal,
+):
     # ============================
     # Start time per agent.
     # ============================
@@ -111,6 +115,7 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
         'results_dir': params.results_dir,
         'trained_models_dir': TRAINED_MODELS_DIR,
     }
+
     high_level_planner_model_args = {
         'is_xcbs': True if test_config.multi_agent_planner_class in ["XECBS", "XCBS"] else False,
         'is_ecbs': True if test_config.multi_agent_planner_class in ["ECBS", "XECBS"] else False,
@@ -120,20 +125,14 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     }
 
     # ============================
-    # Create a results directory.
-    # ============================
-    results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
-    os.makedirs(results_dir, exist_ok=True)
-    num_agents = test_config.num_agents
-
-    # ============================
     # Get planning problem.
     # ============================
     # If want to get random starts and goals, then must do that after creating the reference task and robot.
-    start_l = test_config.start_state_pos_l
-    goal_l = test_config.goal_state_pos_l
+    start_l = horizon_start
+    goal_l = horizon_goal
     global_model_ids = test_config.global_model_ids
     agent_skeleton_l = test_config.agent_skeleton_l
+    num_agents = test_config.num_agents
 
     # ============================
     # Transforms and model tiles setup.
@@ -193,7 +192,6 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     # ============================
     # Run trial.
     # ============================
-    exp_name = f'mmd_single_trial'
 
     # Transform starts and goals to the global frame. Right now they are in the local tile frames.
     start_l = [start_l[i] + global_model_transforms[agent_skeleton_l[i][0][0]][agent_skeleton_l[i][0][1]]
@@ -262,116 +260,233 @@ def run_multi_agent_trial(test_config: MultiAgentPlanningSingleTrialConfig):
     paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
         planner.plan(runtime_limit=test_config.runtime_limit)
     planning_time = time.time() - startt
-    # Print planning times.
-    print(GREEN, 'Planning times:', planning_time, RESET)
+    return paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time
+
+def generate_intermediate_goals(
+    current_start_l,
+    sim_goal_l,
+    num_agents,
+    remaining_timesteps,
+    stride
+):
+    num_agents = len(current_start_l)
+    intermediate_goals = []
+    for i in range(num_agents):
+        # current_start_l[i] and sim_goal_l[i] are (x, y) coordinates (1D tensors of size 2)
+        # We want a linespace of remaining_timesteps points between start and goal (inclusive)
+        linear_traj = torch.stack([
+            torch.linspace(current_start_l[i][0], sim_goal_l[i][0], steps=remaining_timesteps, device=current_start_l[i].device, dtype=current_start_l[i].dtype),
+            torch.linspace(current_start_l[i][1], sim_goal_l[i][1], steps=remaining_timesteps, device=current_start_l[i].device, dtype=current_start_l[i].dtype)
+        ], dim=1)  # shape: (remaining_timesteps, 2)
+        intermediate_goals.append(linear_traj[min(stride, remaining_timesteps - 1)])
+    
+    # Convert to tensor for easier manipulation
+    intermediate_goals = torch.stack(intermediate_goals)
+    
+    # adjust intermediate goals so they are always 0.15 apart
+    min_distance = 0.15
+    max_attempts = 100
+    
+    for attempt in range(max_attempts):
+        # Compute pairwise distances
+        pairwise_dists = torch.cdist(intermediate_goals, intermediate_goals)
+        # Set diagonal to inf to ignore self-distances
+        pairwise_dists = pairwise_dists.fill_diagonal_(float('inf'))
+        
+        # Find pairs that are too close
+        close_mask = pairwise_dists < min_distance
+        
+        if not torch.any(close_mask):
+            break
+        
+        # For each pair that's too close, push them apart minimally
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                if close_mask[i, j]:
+                    # Calculate direction vector from j to i
+                    direction = intermediate_goals[i] - intermediate_goals[j]
+                    distance = torch.norm(direction)
+                    
+                    if distance > 1e-6:
+                        # Normalize direction
+                        direction = direction / distance
+                    else:
+                        # If positions are identical, use random direction
+                        direction = torch.randn(
+                            2,
+                            device=intermediate_goals[i].device,
+                            dtype=intermediate_goals[i].dtype
+                        )
+                        direction = direction / torch.norm(direction)
+                    
+                    # Calculate minimal push distance needed
+                    # Push each position by half the needed distance plus a small buffer
+                    push_distance = (min_distance - distance) / 2 + 0.01
+                    
+                    # Push positions apart
+                    intermediate_goals[i] = intermediate_goals[i] + direction * push_distance
+                    intermediate_goals[j] = intermediate_goals[j] - direction * push_distance
+    
+    if attempt >= max_attempts - 1:
+        print(f"Warning: Could not fully separate intermediate goals after {max_attempts} attempts")
+    
+    # Convert back to list of tensors
+    return [intermediate_goals[i] for i in range(num_agents)]
+
+def run_multi_agent_trial(
+        test_config: MultiAgentPlanningSingleTrialConfig,
+        stride: int = 1
+    ):
+    start_l = test_config.start_state_pos_l
+    goal_l = test_config.goal_state_pos_l
 
     # ============================
-    # Gather stats.
+    # Create a results directory.
     # ============================
-    single_trial_result = MultiAgentPlanningSingleTrialResult()
-    # The associated experiment config.
-    single_trial_result.trial_config = test_config
-    # The planning problem.
-    single_trial_result.start_state_pos_l = [start_l[i].cpu().numpy().tolist() for i in range(num_agents)]
-    single_trial_result.goal_state_pos_l = [goal_l[i].cpu().numpy().tolist() for i in range(num_agents)]
-    single_trial_result.global_model_ids = global_model_ids
-    single_trial_result.agent_skeleton_l = agent_skeleton_l
-    # The agent paths. Each entry is of shape (H, 4).
-    single_trial_result.agent_path_l = paths_l
-    # Success.
-    single_trial_result.success_status = trial_success_status
-    # Number of collisions in the solution.
-    single_trial_result.num_collisions_in_solution = num_collisions_in_solution
-    # Planning time.
-    single_trial_result.planning_time = planning_time
-
-    # Number of agent pairs in collision.
-    if len(paths_l) > 0 and trial_success_status:
-        # This assumes all paths in the solution are of the same length.
-        for t in range(len(paths_l[0])):
-            for i in range(num_agents):
-                for j in range(i + 1, num_agents):
-                    if torch.norm(paths_l[i][t, :2] - paths_l[j][t, :2]) < 2.0 * params.robot_planar_disk_radius:
-                        # The above should be reference_robot.radius.
-                        print(RED, 'Collision in solution:', i, j, t, paths_l[i][t, :2], paths_l[j][t, :2], RESET)
-                        single_trial_result.num_collisions_in_solution += 1
-        if single_trial_result.num_collisions_in_solution > 0:
-            single_trial_result.success_status = TrialSuccessStatus.FAIL_COLLISION_AGENTS
-
-    # If not successful, return here.
-    if trial_success_status:
-        # Our metric for determining how well a path is adhering to the data.
-        # Computed by the environment. If it is a single map, the score is the adherence there.
-        # If it is a multi-tile map, the score is the average adherence over all tiles.
-        single_trial_result.data_adherence = 0.0
-        for agent_id in range(num_agents):
-            agent_data_adherence = 0.0
-            for skeleton_step, agent_model_id in enumerate(agent_model_ids_l[agent_id]):
-                agent_model_transform = agent_model_transforms_l[agent_id][skeleton_step]
-                agent_start_time = start_time_l[agent_id]
-                single_tile_traj_len = params.horizon
-                agent_path_in_model_frame = (paths_l[agent_id].clone()[
-                                             agent_start_time + skeleton_step * single_tile_traj_len:
-                                             agent_start_time + (skeleton_step + 1) * single_tile_traj_len, :2] -
-                                             agent_model_transform)
-                model_env_name = agent_model_id.split('-')[0]
-                kwargs = {'tensor_args': tensor_args}
-                env_object = eval(model_env_name)(**kwargs)
-                agent_data_adherence += env_object.compute_traj_data_adherence(agent_path_in_model_frame)
-            agent_data_adherence /= len(agent_model_ids_l[agent_id])
-            single_trial_result.data_adherence += agent_data_adherence
-        single_trial_result.data_adherence /= num_agents
-        # CT nodes expanded.
-        single_trial_result.num_ct_expansions = num_ct_expansions
-        # Path length. Hack for experiments.
-        single_trial_result.path_length_per_agent = 0.0
-        for agent_id in range(num_agents):
-            # agent_path_pos = low_level_planner_l[agent_id].robot.get_position(paths_l[agent_id]).unsqueeze(0)
-            agent_path_pos = paths_l[agent_id][:, :2].unsqueeze(0)
-            single_trial_result.path_length_per_agent += compute_path_length_from_pos(agent_path_pos).item()
-        single_trial_result.path_length_per_agent /= num_agents
-        # Path smoothness.
-        single_trial_result.mean_path_acceleration_per_agent = 0.0
-        for agent_id in range(num_agents):
-            # agent_path_pos = low_level_planner_l[agent_id].robot.get_position(paths_l[agent_id]).unsqueeze(0)
-            # agent_path_vel = low_level_planner_l[agent_id].robot.get_velocity(paths_l[agent_id]).unsqueeze(0)
-            agent_path_pos = paths_l[agent_id][:, :2].unsqueeze(0)
-            agent_path_vel = paths_l[agent_id][:, 2:].unsqueeze(0)
-            if agent_path_vel.shape[-1] == 0:
-                agent_path_vel = low_level_planner_l[agent_id].robot.get_velocity(paths_l[agent_id]).unsqueeze(0)
-
-            single_trial_result.mean_path_acceleration_per_agent += (
-                compute_average_acceleration_from_pos_vel(agent_path_pos, agent_path_vel).item())
-        single_trial_result.mean_path_acceleration_per_agent /= num_agents
-    # ============================
-    # Save the results and config.
-    # ============================
-    print(GREEN, single_trial_result, RESET)
-    results_dir_uri = f'file://{os.path.abspath(results_dir)}'
-    print('Results dir:', results_dir_uri)
-    single_trial_result.save(results_dir)
-    test_config.save(results_dir)
+    results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
+    os.makedirs(results_dir, exist_ok=True)
 
     # ============================
-    # Render.
+    # Setup for rendering
     # ============================
-    if trial_success_status and len(paths_l) > 0:
-        planner.render_paths(paths_l,
-                             output_fpath=os.path.join(results_dir, f'{exp_name}.gif'),
-                             animation_duration=0,
-                             plot_trajs=True,
-                             show_robot_in_image=True)
-        if test_config.render_animation:
-            paths_l = densify_trajs(paths_l, 1)  # <------ Larger numbers produce nicer animations. But take longer to make too.
-            planner.render_paths(paths_l,
-                                 output_fpath=os.path.join(results_dir, f'{exp_name}.gif'),
-                                 plot_trajs=True,
-                                 animation_duration=10)
+    num_agents = test_config.num_agents
+    global_model_ids = test_config.global_model_ids
+    agent_skeleton_l = test_config.agent_skeleton_l
+    
+    # Create transforms
+    tile_width = 2.0
+    tile_height = 2.0
+    global_model_transforms = [[torch.tensor([x * tile_width, -y * tile_height], **tensor_args)
+                                for x in range(len(global_model_ids[0]))] for y in range(len(global_model_ids))]
+    
+    # Transform starts and goals to global frame
+    start_l = [start_l[i] + global_model_transforms[agent_skeleton_l[i][0][0]][agent_skeleton_l[i][0][1]]
+               for i in range(num_agents)]
+    goal_l = [goal_l[i] + global_model_transforms[agent_skeleton_l[i][-1][0]][agent_skeleton_l[i][-1][1]]
+              for i in range(num_agents)]
+    
+    # Create reference planner for visualization
+    reference_agent_skeleton = [[r, c] for r in range(len(global_model_ids))
+                                for c in range(len(global_model_ids[0]))]
+    reference_agent_transforms = {}
+    reference_agent_model_ids = {}
+    for skeleton_step in range(len(reference_agent_skeleton)):
+        skeleton_model_coord = reference_agent_skeleton[skeleton_step]
+        reference_agent_transforms[skeleton_step] = global_model_transforms[skeleton_model_coord[0]][
+            skeleton_model_coord[1]]
+        reference_agent_model_ids[skeleton_step] = global_model_ids[skeleton_model_coord[0]][
+            skeleton_model_coord[1]]
+    reference_agent_model_ids = [reference_agent_model_ids[i] for i in range(len(reference_agent_model_ids))]
+    
+    # ============================
+    # Horizon-based planning parameters
+    # ============================
+    num_timesteps = 64  # Total number of timesteps in final trajectory
+    
+    # Initialize storage for the full trajectories
+    # Start with the initial start positions/velocities for each agent
+    # Pad positions with zero velocities if needed to match path state dimensions (pos + vel)
+    full_trajectories = []
+    for s in start_l:
+        if s.shape[0] == 2:
+            # Position only, add zero velocities
+            initial_state = torch.cat([s, torch.zeros(2, **tensor_args)])
+        else:
+            # Already has velocities
+            initial_state = s.clone()
+        full_trajectories.append([initial_state])
+    
+    # Initialize current starts and goals
+    sim_start_l = [s.clone() for s in start_l]
+    sim_goal_l = goal_l  # Goals remain the same
+    
+    # Statistics accumulators
+    total_ct_expansions = 0
+    total_planning_time = 0.0
+    total_collisions = 0
+    final_success_status = TrialSuccessStatus.SUCCESS
+    
+    print(f"{BLUE}Starting horizon-based planning for {num_timesteps} timesteps{RESET}")
+    
+    # ============================
+    # Main horizon-based planning loop
+    # ============================
+    # Calculate number of planning iterations needed
+    # We start with 1 waypoint (initial state) and add stride waypoints each iteration
+    num_planning_iterations = (num_timesteps - 1 + stride - 1) // stride  # ceiling division
+    print(f"Planning iterations needed: {num_planning_iterations}, stride: {stride}, target timesteps: {num_timesteps}")
+    current_start_l = sim_start_l
+    remaining_timesteps = num_timesteps
+    full_trajectories = [[] for _ in range(num_agents)]
+    
+    for iteration in range(num_planning_iterations):
+        print(f"\n{CYAN}=== Planning Iteration {iteration + 1}/{num_planning_iterations} ==={RESET}")
+        print(f"Current starts: {current_start_l}")
 
+        # Generate intermediate goals based on current position and remaining timesteps
+        # This ensures goals adapt to the actual path taken
+        current_goal_l = generate_intermediate_goals(
+            current_start_l, sim_goal_l, num_agents, remaining_timesteps, stride
+        )
+        
+        # Update remaining timesteps for next iteration
+        remaining_timesteps = max(stride, remaining_timesteps - stride)
+
+        
+        # Call run_horizon_step with current start and goal
+        paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time = \
+            run_horizon_step(
+                test_config,
+                current_start_l,
+                current_goal_l
+            )
+        
+        # condense trajectories and update current_state_l
+        num_steps = num_timesteps // stride
+        paths_l = [paths_l[i][::num_steps] for i in range(num_agents)]
+        current_start_l = [paths_l[i][-1][:2] for i in range(num_agents)]
+        for i in range(num_agents):
+            full_trajectories[i].extend(paths_l[i])
+    
+    # ============================
+    # Convert trajectories to tensors
+    # ============================
+    final_trajectories = []
+    for agent_id in range(num_agents):
+        if len(full_trajectories[agent_id]) > 0:
+            traj = torch.stack(full_trajectories[agent_id])
+            final_trajectories.append(traj)
+        else:
+            final_trajectories.append(None)
+    
+    # ============================
+    # Print summary and save results
+    # ============================
+    print(f"\n{CYAN}{'='*60}{RESET}")
+    print(f"{BLUE}Horizon-based planning completed{RESET}")
+    print(f"Total planning time: {total_planning_time:.3f}s")
+    print(f"Total CT expansions: {total_ct_expansions}")
+    print(f"Total collisions: {total_collisions}")
+    print(f"Final status: {final_success_status}")
+    print(f"{CYAN}{'='*60}{RESET}\n")
+    
+    # ============================
+    # Render trajectories
+    # ============================
+    print(f"Final Trajectories: {final_trajectories}")
+    exp_name = 'mmd_horizon_based_trial'
+    if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
+        print(f"\n{CYAN}Rendering trajectories...{RESET}")
+        plot_starts = torch.stack(start_l)
+        plot_goals = torch.stack(goal_l)
+        plot_trajs = torch.stack(final_trajectories)
+        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), agent_radius=0.3, show_velocity_arrows=False, dpi=300)
+    else:
+        print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
 
 if __name__ == '__main__':
     test_config_single_tile = MultiAgentPlanningSingleTrialConfig()
-    test_config_single_tile.num_agents = 20 
+    test_config_single_tile.num_agents = 5
     test_config_single_tile.instance_name = "test"
     test_config_single_tile.multi_agent_planner_class = "XECBS"  # Or "ECBS" or "XCBS" or "CBS" or "PP".
     test_config_single_tile.single_agent_planner_class = "MPDEnsemble"  # Or "MPD"
@@ -379,6 +494,7 @@ if __name__ == '__main__':
     test_config_single_tile.runtime_limit = 60 * 3  # 3 minutes.
     test_config_single_tile.time_str = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
+    stride = 32
 
     example_type = "single_tile"
     # example_type = "multi_tile"
@@ -402,6 +518,12 @@ if __name__ == '__main__':
                                          tensor_args,
                                          margin=0.2,
                                          obstacle_margin=0.11)
+
+        # custom start/end positions
+        # test_config_single_tile.start_state_pos_l = [torch.tensor([-0.0796, -0.0326], device='cuda:0'), torch.tensor([0.3682, 0.8917], device='cuda:0'), torch.tensor([-0.3945, -0.0336], device='cuda:0'), torch.tensor([ 0.2185, -0.0062], device='cuda:0'), torch.tensor([-0.0910, -0.8407], device='cuda:0')]
+        test_config_single_tile.start_state_pos_l = [torch.tensor([-0.4516, -0.4459], device='cuda:0'), torch.tensor([-0.2675,  0.6612], device='cuda:0'), torch.tensor([ 0.1625, -0.0624], device='cuda:0'), torch.tensor([0.5106, 0.1467], device='cuda:0'), torch.tensor([ 0.3862, -0.0221], device='cuda:0')]
+        test_config_single_tile.goal_state_pos_l = [torch.tensor([-0.8195, -0.8549], device='cuda:0'), torch.tensor([-0.8912,  0.4165], device='cuda:0'), torch.tensor([ 0.8553, -0.0655], device='cuda:0'), torch.tensor([0.8197, 0.2912], device='cuda:0'), torch.tensor([0.7436, 0.7578], device='cuda:0')]
+        
         # get_start_goal_pos_circle(test_config_single_tile.num_agents, 0.8)
         # Another option is to get random starts and goals.
         # get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
@@ -417,7 +539,7 @@ if __name__ == '__main__':
         print("Starts:", test_config_single_tile.start_state_pos_l)
         print("Goals:", test_config_single_tile.goal_state_pos_l)
 
-        run_multi_agent_trial(test_config_single_tile)
+        run_multi_agent_trial(test_config_single_tile, stride=stride)
         print(GREEN, 'OK.', RESET)
 
     # ============================
@@ -439,5 +561,5 @@ if __name__ == '__main__':
              torch.tensor([[0, -0.8], [0, -0.3], [0, 0.3], [0, 0.8]], **tensor_args))
         print(test_config_multiple_tiles.start_state_pos_l)
         test_config_multiple_tiles.multi_agent_planner_class = "XECBS"
-        run_multi_agent_trial(test_config_multiple_tiles)
+        run_multi_agent_trial(test_config_multiple_tiles, stride=stride)
         print(GREEN, 'OK.', RESET)
