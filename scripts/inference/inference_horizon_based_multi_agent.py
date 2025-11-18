@@ -57,7 +57,7 @@ from torch_robotics.trajectory.metrics import compute_smoothness, compute_path_l
 from torch_robotics.trajectory.utils import interpolate_traj_via_points
 from torch_robotics.visualizers.planning_visualizer import PlanningVisualizer
 from torch_robotics.robots.robot_planar_disk import RobotPlanarDisk
-from mmd.planners.multi_agent import CBS, PrioritizedPlanning
+from mmd.planners.multi_agent import CBS, CBSMasked, PrioritizedPlanning
 from mmd.planners.single_agent import MPD, MPDEnsemble
 from mmd.common.constraints import MultiPointConstraint, VertexConstraint, EdgeConstraint
 from mmd.common.conflicts import VertexConflict, PointConflict, EdgeConflict
@@ -69,7 +69,22 @@ from mmd.config.mmd_params import MMDParams as params
 from mmd.common.experiments import MultiAgentPlanningSingleTrialConfig, MultiAgentPlanningSingleTrialResult, \
     get_result_dir_from_trial_config, TrialSuccessStatus
 from torch_robotics.environments import *
-from mmd.utils.plot_trajs import create_trajectory_gif
+from mmd.utils.plot_trajs import create_trajectory_gif, create_masked_trajectory_gif
+from typing import Any
+import jax.numpy as jnp
+import numpy as np
+
+# Import from train_gnn using importlib to avoid modifying sys.path
+import importlib.util
+import sys as _sys
+_train_gnn_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../src/models/train_gnn.py'))
+_spec = importlib.util.spec_from_file_location("train_gnn", _train_gnn_path)
+_train_gnn_module = importlib.util.module_from_spec(_spec)
+_sys.modules["train_gnn"] = _train_gnn_module
+_spec.loader.exec_module(_train_gnn_module)
+load_trained_gnn_models = _train_gnn_module.load_trained_gnn_models
+GNNSelectionNetwork = _train_gnn_module.GNNSelectionNetwork
+del _train_gnn_path, _spec, _train_gnn_module, _sys
 
 allow_ops_in_compiled_graph()
 
@@ -81,10 +96,35 @@ device = 'cuda'
 device = get_torch_device(device)
 tensor_args = {'device': device, 'dtype': torch.float32}
 
+def get_player_masks(past_trajs: List[torch.Tensor], model, model_state):
+    # convert past_trajs to jnp
+    past_trajs_jnp = []
+    for i in range(len(past_trajs)):
+        if hasattr(past_trajs[i], 'detach'):
+            arr = past_trajs[i].detach().cpu().numpy()
+        else:
+            arr = np.array(past_trajs[i])
+        past_trajs_jnp.append(jnp.array(arr))
+
+    # transpose to be (batch_size, T_observation, N_agents, state_dim)
+    past_x_trajs = jnp.stack(past_trajs_jnp, axis=0)
+    batch_past_x_trajs = past_x_trajs[None, ...]
+    batch_past_x_trajs = batch_past_x_trajs.transpose(0, 2, 1, 3)
+
+    # call model
+    masks = model.apply({'params': model_state['params']}, batch_past_x_trajs, deterministic=True)
+    masks = masks.squeeze(0)
+    masks_np = np.array(masks)
+    masks_torch = torch.from_numpy(masks_np).to(**tensor_args)
+    return masks_torch
+
 def run_horizon_step(
     test_config,
     horizon_start,
     horizon_goal,
+    past_trajs,
+    model,
+    model_state,
 ):
     # ============================
     # Start time per agent.
@@ -242,7 +282,11 @@ def run_horizon_step(
     # Create the multi agent planner.
     # ============================
     if (test_config.multi_agent_planner_class in ["XECBS", "ECBS", "XCBS", "CBS"]):
-        multi_agent_planner_class = CBS
+        # use masked version of planner if we are using player selection model
+        if model is not None:
+            multi_agent_planner_class = CBSMasked
+        else:
+            multi_agent_planner_class = CBS
     elif test_config.multi_agent_planner_class == "PP":
         multi_agent_planner_class = PrioritizedPlanning
     else:
@@ -254,20 +298,26 @@ def run_horizon_step(
                                         reference_robot=reference_robot,
                                         **high_level_planner_model_args)
     # ============================
+    # Calculate player masks.
+    # ============================
+    player_masks = get_player_masks(past_trajs, model, model_state)
+    player_masks = (player_masks >= 0.5).float()
+
+    # ============================
     # Plan.
     # ============================
     startt = time.time()
     paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
         planner.plan(runtime_limit=test_config.runtime_limit)
     planning_time = time.time() - startt
-    return paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time
+    return paths_l, player_masks, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time
 
 def generate_intermediate_goals(
     current_start_l,
     sim_goal_l,
     num_agents,
     remaining_timesteps,
-    stride
+    stride,
 ):
     num_agents = len(current_start_l)
     intermediate_goals = []
@@ -335,7 +385,9 @@ def generate_intermediate_goals(
 
 def run_multi_agent_trial(
         test_config: MultiAgentPlanningSingleTrialConfig,
-        stride: int = 1
+        stride: int = 1,
+        model_past_horizon: int = 10,
+        model_path: str = None,
     ):
     start_l = test_config.start_state_pos_l
     goal_l = test_config.goal_state_pos_l
@@ -358,6 +410,11 @@ def run_multi_agent_trial(
     tile_height = 2.0
     global_model_transforms = [[torch.tensor([x * tile_width, -y * tile_height], **tensor_args)
                                 for x in range(len(global_model_ids[0]))] for y in range(len(global_model_ids))]
+    
+    # ============================
+    # Load model.
+    # ============================
+    model, model_state = load_trained_gnn_models(model_path, obs_input_type="full")
     
     # Transform starts and goals to global frame
     start_l = [start_l[i] + global_model_transforms[agent_skeleton_l[i][0][0]][agent_skeleton_l[i][0][1]]
@@ -417,11 +474,11 @@ def run_multi_agent_trial(
     print(f"Planning iterations needed: {num_planning_iterations}, stride: {stride}, target timesteps: {num_timesteps}")
     current_start_l = sim_start_l
     remaining_timesteps = num_timesteps
-    full_trajectories = [[] for _ in range(num_agents)]
+    full_trajectories = [[torch.cat([sim_start_l[i], torch.zeros(2, **tensor_args)])] for i in range(num_agents)]
+    sim_masks = []
     
     for iteration in range(num_planning_iterations):
         print(f"\n{CYAN}=== Planning Iteration {iteration + 1}/{num_planning_iterations} ==={RESET}")
-        print(f"Current starts: {current_start_l}")
 
         # Generate intermediate goals based on current position and remaining timesteps
         # This ensures goals adapt to the actual path taken
@@ -432,14 +489,38 @@ def run_multi_agent_trial(
         # Update remaining timesteps for next iteration
         remaining_timesteps = max(stride, remaining_timesteps - stride)
 
-        
+        # calculate past trajectories
+        past_trajs = []
+        for i in range(num_agents):
+            start_ind = max(0, len(full_trajectories[i]) - model_past_horizon)
+            agent_past_traj = full_trajectories[i][start_ind:]
+            
+            # Always stack the trajectory into a tensor
+            agent_past_traj = torch.stack(agent_past_traj, dim=0)
+            
+            # Add padding if needed
+            if len(agent_past_traj) < model_past_horizon:
+                padding = agent_past_traj[-1:].repeat(model_past_horizon - len(agent_past_traj), 1)
+                agent_past_traj = torch.cat([agent_past_traj, padding])
+            
+            past_trajs.append(agent_past_traj)
+        past_trajs = torch.stack(past_trajs)
+
         # Call run_horizon_step with current start and goal
-        paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time = \
+        paths_l, player_masks, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time = \
             run_horizon_step(
                 test_config,
                 current_start_l,
-                current_goal_l
+                current_goal_l,
+                past_trajs,
+                model,
+                model_state,
             )
+        
+        extend_amount = min(stride, remaining_timesteps)
+        if iteration == 0:
+            extend_amount += 1 # account for fact full_trajectories is already padded with initial state
+        sim_masks.extend([player_masks] * extend_amount)
         
         # condense trajectories and update current_state_l
         num_steps = num_timesteps // stride
@@ -480,13 +561,15 @@ def run_multi_agent_trial(
         plot_starts = torch.stack(start_l)
         plot_goals = torch.stack(goal_l)
         plot_trajs = torch.stack(final_trajectories)
-        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), agent_radius=0.3, show_velocity_arrows=False, dpi=300)
+        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+        create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+
     else:
         print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
 
 if __name__ == '__main__':
     test_config_single_tile = MultiAgentPlanningSingleTrialConfig()
-    test_config_single_tile.num_agents = 5
+    test_config_single_tile.num_agents = 15 
     test_config_single_tile.instance_name = "test"
     test_config_single_tile.multi_agent_planner_class = "XECBS"  # Or "ECBS" or "XCBS" or "CBS" or "PP".
     test_config_single_tile.single_agent_planner_class = "MPDEnsemble"  # Or "MPD"
@@ -494,7 +577,9 @@ if __name__ == '__main__':
     test_config_single_tile.runtime_limit = 60 * 3  # 3 minutes.
     test_config_single_tile.time_str = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
-    stride = 32
+    
+    player_selection_model_path = "/home/alex/gnn_game_planning/log/gnn_full_MP_2_edge-metric_full_top-k_5/train_n_agents_10_T_50_obs_10_lr_0.0003_bs_32_sigma1_0.11_sigma2_0.11_epochs_50_loss_type_similarity/20251108_103120/psn_best_model.pkl"
+    stride = 16
 
     example_type = "single_tile"
     # example_type = "multi_tile"
@@ -511,7 +596,7 @@ if __name__ == '__main__':
 
         # Choose starts and goals.
         test_config_single_tile.agent_skeleton_l = [[[0, 0]]] * test_config_single_tile.num_agents
-        torch.random.manual_seed(10)
+        # torch.random.manual_seed(10)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
         get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
                                          EnvDropRegion2D,
@@ -521,8 +606,6 @@ if __name__ == '__main__':
 
         # custom start/end positions
         # test_config_single_tile.start_state_pos_l = [torch.tensor([-0.0796, -0.0326], device='cuda:0'), torch.tensor([0.3682, 0.8917], device='cuda:0'), torch.tensor([-0.3945, -0.0336], device='cuda:0'), torch.tensor([ 0.2185, -0.0062], device='cuda:0'), torch.tensor([-0.0910, -0.8407], device='cuda:0')]
-        test_config_single_tile.start_state_pos_l = [torch.tensor([-0.4516, -0.4459], device='cuda:0'), torch.tensor([-0.2675,  0.6612], device='cuda:0'), torch.tensor([ 0.1625, -0.0624], device='cuda:0'), torch.tensor([0.5106, 0.1467], device='cuda:0'), torch.tensor([ 0.3862, -0.0221], device='cuda:0')]
-        test_config_single_tile.goal_state_pos_l = [torch.tensor([-0.8195, -0.8549], device='cuda:0'), torch.tensor([-0.8912,  0.4165], device='cuda:0'), torch.tensor([ 0.8553, -0.0655], device='cuda:0'), torch.tensor([0.8197, 0.2912], device='cuda:0'), torch.tensor([0.7436, 0.7578], device='cuda:0')]
         
         # get_start_goal_pos_circle(test_config_single_tile.num_agents, 0.8)
         # Another option is to get random starts and goals.
@@ -539,7 +622,7 @@ if __name__ == '__main__':
         print("Starts:", test_config_single_tile.start_state_pos_l)
         print("Goals:", test_config_single_tile.goal_state_pos_l)
 
-        run_multi_agent_trial(test_config_single_tile, stride=stride)
+        run_multi_agent_trial(test_config_single_tile, stride=stride, model_path=player_selection_model_path)
         print(GREEN, 'OK.', RESET)
 
     # ============================

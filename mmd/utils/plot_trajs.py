@@ -13,12 +13,12 @@ def create_trajectory_gif(
     output_path: str,
     fps: int = 10,
     figsize: Tuple[int, int] = (10, 10),
-    agent_radius: float = 0.01,
+    agent_radius: float = 0.05,
     show_velocity_arrows: bool = False,
     title: Optional[str] = None,
     xlim: Optional[Tuple[float, float]] = None,
     ylim: Optional[Tuple[float, float]] = None,
-    dpi: int = 100
+    dpi: int = 300
 ) -> None:
     """
     Create a gif animation of multi-agent trajectories.
@@ -74,9 +74,14 @@ def create_trajectory_gif(
     num_agents, time_steps, _ = trajectories.shape
     
     # Generate distinct colors for each agent
-    colors = plt.cm.tab10(np.linspace(0, 1, min(num_agents, 10)))
-    if num_agents > 10:
-        colors = plt.cm.rainbow(np.linspace(0, 1, num_agents))
+    # Use different colormaps for better distinctiveness
+    if num_agents <= 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, 10))[:num_agents]
+    elif num_agents <= 20:
+        colors = plt.cm.tab20(np.linspace(0, 1, 20))[:num_agents]
+    else:
+        # For many agents, use hsv colormap which provides good spread
+        colors = plt.cm.hsv(np.linspace(0, 0.95, num_agents))
     
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=figsize)
@@ -108,13 +113,30 @@ def create_trajectory_gif(
         
         # Start position (circle marker)
         start_x, start_y = starts[agent_idx, 0], starts[agent_idx, 1]
-        ax.plot(start_x, start_y, 'o', color=color, markersize=12, 
-                label=f'Agent {agent_idx} Start', zorder=5)
+        ax.plot(start_x, start_y, 'o', color=color, markersize=12, zorder=5)
+        
+        # Add agent number text label at start position
+        ax.text(start_x, start_y, str(agent_idx), color='white', 
+                fontsize=8, fontweight='bold', ha='center', va='center', 
+                zorder=6)
         
         # Goal position (star marker)
         goal_x, goal_y = goals[agent_idx, 0], goals[agent_idx, 1]
-        ax.plot(goal_x, goal_y, '*', color=color, markersize=20, 
-                label=f'Agent {agent_idx} Goal', zorder=5)
+        ax.plot(goal_x, goal_y, '*', color=color, markersize=20, zorder=5)
+        
+        # Add agent number text label at goal position
+        ax.text(goal_x, goal_y, str(agent_idx), color='white', 
+                fontsize=8, fontweight='bold', ha='center', va='center', 
+                zorder=6)
+    
+    # Add legend for start and goal markers (not per-agent)
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label='Start Position',
+                   markerfacecolor='gray', markersize=10),
+        plt.Line2D([0], [0], marker='*', color='w', label='Goal Position',
+                   markerfacecolor='gray', markersize=15)
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
     
     # Initialize trajectory lines and agent circles
     trajectory_lines = []
@@ -191,3 +213,285 @@ def create_trajectory_gif(
     
     plt.close(fig)
     print(f"Trajectory gif saved to: {output_path}")
+
+
+def create_masked_trajectory_gif(
+    trajectories,
+    starts,
+    goals,
+    agent_id: int,
+    mask,
+    output_path: str,
+    fps: int = 10,
+    figsize: Tuple[int, int] = (10, 10),
+    agent_radius: float = 0.05,
+    show_velocity_arrows: bool = False,
+    title: Optional[str] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    dpi: int = 300
+) -> None:
+    """
+    Create a gif animation of multi-agent trajectories with masking visualization.
+    
+    The ego agent (agent_id) is highlighted in blue, agents in the mask are shown in red,
+    and agents not in the mask are shown in gray.
+    
+    Parameters
+    ----------
+    trajectories : np.ndarray or torch.Tensor
+        Trajectories array of shape (num_agents, time_steps, 4) where the last 
+        dimension consists of (px, py, vx, vy):
+        - px, py: x, y position
+        - vx, vy: x, y velocity
+    starts : np.ndarray or torch.Tensor
+        Start positions array of shape (num_agents, 2) where each row contains
+        (x, y) coordinates of the start position for each agent
+    goals : np.ndarray or torch.Tensor
+        Goal positions array of shape (num_agents, 2) where each row contains
+        (x, y) coordinates of the goal position for each agent
+    agent_id : int
+        The ID of the ego agent to highlight in blue
+    mask : list of np.ndarray or torch.Tensor
+        List of length time_steps, where each element is a binary mask array of shape 
+        (num_agents, num_agents). mask[t][i][j] indicates whether agent i can see agent j
+        at time step t (1 = visible/in mask, 0 = not visible).
+        Can also be a single np.ndarray or torch.Tensor of shape (time_steps, num_agents, num_agents).
+    output_path : str
+        Path to save the output gif file
+    fps : int, optional
+        Frames per second for the gif, by default 10
+    figsize : Tuple[int, int], optional
+        Figure size in inches, by default (10, 10)
+    agent_radius : float, optional
+        Radius of agent circles in the plot, by default 0.05
+    show_velocity_arrows : bool, optional
+        Whether to show velocity arrows, by default False
+    title : Optional[str], optional
+        Title for the plot, by default None
+    xlim : Optional[Tuple[float, float]], optional
+        X-axis limits, by default None (auto-computed from data)
+    ylim : Optional[Tuple[float, float]], optional
+        Y-axis limits, by default None (auto-computed from data)
+    dpi : int, optional
+        DPI for the output gif, by default 100
+    """
+    # Convert torch tensors to numpy arrays if needed
+    if hasattr(trajectories, 'cpu'):
+        trajectories = trajectories.cpu().detach().numpy()
+    elif not isinstance(trajectories, np.ndarray):
+        trajectories = np.array(trajectories)
+    
+    if hasattr(starts, 'cpu'):
+        starts = starts.cpu().detach().numpy()
+    elif not isinstance(starts, np.ndarray):
+        starts = np.array(starts)
+    
+    if hasattr(goals, 'cpu'):
+        goals = goals.cpu().detach().numpy()
+    elif not isinstance(goals, np.ndarray):
+        goals = np.array(goals)
+    
+    num_agents, time_steps, _ = trajectories.shape
+    
+    # Handle mask input - convert list of tensors to numpy array
+    if isinstance(mask, list):
+        # List of tensors/arrays, each of shape (num_agents, num_agents)
+        mask_list = []
+        for m in mask:
+            if hasattr(m, 'cpu'):
+                mask_list.append(m.cpu().detach().numpy())
+            elif isinstance(m, np.ndarray):
+                mask_list.append(m)
+            else:
+                mask_list.append(np.array(m))
+        # Stack into shape (time_steps, num_agents, num_agents)
+        mask_array = np.stack(mask_list, axis=0)
+    else:
+        # Single array or tensor
+        if hasattr(mask, 'cpu'):
+            mask_array = mask.cpu().detach().numpy()
+        elif isinstance(mask, np.ndarray):
+            mask_array = mask
+        else:
+            mask_array = np.array(mask)
+    
+    # Extract mask for the specified agent_id
+    # mask_array shape: (time_steps, num_agents, num_agents)
+    # mask_array[t, agent_id, :] gives which agents are visible to agent_id at time t
+    if mask_array.ndim != 3:
+        raise ValueError(f"Unexpected mask shape: {mask_array.shape}. Expected (time_steps, num_agents, num_agents)")
+    
+    if mask_array.shape[0] != time_steps:
+        raise ValueError(f"Mask time dimension {mask_array.shape[0]} does not match trajectories time dimension {time_steps}")
+    
+    if mask_array.shape[1] != num_agents or mask_array.shape[2] != num_agents:
+        raise ValueError(f"Mask agent dimensions {mask_array.shape[1:]}, do not match number of agents {num_agents}")
+    
+    # Extract the mask for the ego agent: shape (time_steps, num_agents)
+    agent_mask = mask_array[:, agent_id, :]
+    
+    # Define colors
+    ego_color = 'blue'
+    masked_color = 'red'
+    unmasked_color = 'gray'
+    
+    # Set up the figure and axis
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Compute axis limits if not provided
+    if xlim is None:
+        all_x = trajectories[:, :, 0].flatten()
+        x_margin = (all_x.max() - all_x.min()) * 0.1
+        xlim = (all_x.min() - x_margin, all_x.max() + x_margin)
+    
+    if ylim is None:
+        all_y = trajectories[:, :, 1].flatten()
+        y_margin = (all_y.max() - all_y.min()) * 0.1
+        ylim = (all_y.min() - y_margin, all_y.max() + y_margin)
+    
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X Position')
+    ax.set_ylabel('Y Position')
+    
+    if title:
+        ax.set_title(title)
+    else:
+        ax.set_title(f'Agent {agent_id} Perspective (Masked View)')
+    
+    # Plot start positions and goal positions (static elements)
+    for agent_idx in range(num_agents):
+        if agent_idx == agent_id:
+            color = ego_color
+        else:
+            # Use gray for start/goal (will be colored during animation)
+            color = 'lightgray'
+        
+        # Start position (circle marker)
+        start_x, start_y = starts[agent_idx, 0], starts[agent_idx, 1]
+        ax.plot(start_x, start_y, 'o', color=color, markersize=12, zorder=5, alpha=0.6)
+        
+        # Add agent number text label at start position
+        ax.text(start_x, start_y, str(agent_idx), color='white', 
+                fontsize=8, fontweight='bold', ha='center', va='center', 
+                zorder=6)
+        
+        # Goal position (star marker)
+        goal_x, goal_y = goals[agent_idx, 0], goals[agent_idx, 1]
+        ax.plot(goal_x, goal_y, '*', color=color, markersize=20, zorder=5, alpha=0.6)
+        
+        # Add agent number text label at goal position
+        ax.text(goal_x, goal_y, str(agent_idx), color='white', 
+                fontsize=8, fontweight='bold', ha='center', va='center', 
+                zorder=6)
+    
+    # Add legend
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label=f'Ego Agent {agent_id}',
+                   markerfacecolor=ego_color, markersize=10),
+        plt.Line2D([0], [0], marker='o', color='w', label='Masked Agents',
+                   markerfacecolor=masked_color, markersize=10),
+        plt.Line2D([0], [0], marker='o', color='w', label='Unmasked Agents',
+                   markerfacecolor=unmasked_color, markersize=10),
+        plt.Line2D([0], [0], marker='o', color='w', label='Start Position',
+                   markerfacecolor='lightgray', markersize=10),
+        plt.Line2D([0], [0], marker='*', color='w', label='Goal Position',
+                   markerfacecolor='lightgray', markersize=15)
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
+    
+    # Initialize trajectory lines and agent circles
+    trajectory_lines = []
+    agent_circles = []
+    velocity_arrows = []
+    
+    for agent_idx in range(num_agents):
+        # Initial color (will be updated in animation)
+        if agent_idx == agent_id:
+            color = ego_color
+        else:
+            color = unmasked_color
+        
+        # Trajectory line (will be updated each frame)
+        line, = ax.plot([], [], '-', color=color, linewidth=2, alpha=0.6, zorder=3)
+        trajectory_lines.append(line)
+        
+        # Agent circle (current position)
+        circle = Circle((0, 0), agent_radius, color=color, alpha=0.8, zorder=10)
+        ax.add_patch(circle)
+        agent_circles.append(circle)
+        
+        # Velocity arrow (optional)
+        if show_velocity_arrows:
+            arrow = ax.arrow(0, 0, 0, 0, head_width=0.3, head_length=0.3, 
+                           fc=color, ec=color, alpha=0.7, zorder=8)
+            velocity_arrows.append(arrow)
+    
+    # Time text
+    time_text = ax.text(0.02, 0.98, '', transform=ax.transAxes, 
+                       verticalalignment='top', fontsize=12,
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Animation update function
+    def update(frame):
+        # Get mask for current frame
+        current_mask = agent_mask[frame]  # Shape: (num_agents,)
+        
+        # Update trajectory lines (show path up to current frame)
+        for agent_idx in range(num_agents):
+            # Determine color based on agent role
+            if agent_idx == agent_id:
+                color = ego_color
+            elif current_mask[agent_idx]:
+                color = masked_color
+            else:
+                color = unmasked_color
+            
+            traj_x = trajectories[agent_idx, :frame+1, 0]
+            traj_y = trajectories[agent_idx, :frame+1, 1]
+            trajectory_lines[agent_idx].set_data(traj_x, traj_y)
+            trajectory_lines[agent_idx].set_color(color)
+            
+            # Update agent position
+            current_x = trajectories[agent_idx, frame, 0]
+            current_y = trajectories[agent_idx, frame, 1]
+            agent_circles[agent_idx].center = (current_x, current_y)
+            agent_circles[agent_idx].set_color(color)
+            
+            # Update velocity arrows if enabled
+            if show_velocity_arrows and frame < time_steps:
+                vx = trajectories[agent_idx, frame, 2]
+                vy = trajectories[agent_idx, frame, 3]
+                # Remove old arrow and create new one
+                if velocity_arrows[agent_idx] in ax.patches:
+                    velocity_arrows[agent_idx].remove()
+                
+                arrow = ax.arrow(current_x, current_y, vx, vy, 
+                               head_width=0.3, head_length=0.3,
+                               fc=color, ec=color, 
+                               alpha=0.7, zorder=8)
+                velocity_arrows[agent_idx] = arrow
+        
+        # Update time text
+        time_text.set_text(f'Time Step: {frame}/{time_steps-1}')
+        
+        artists = trajectory_lines + agent_circles + [time_text]
+        if show_velocity_arrows:
+            artists += velocity_arrows
+        return artists
+    
+    # Create animation
+    anim = animation.FuncAnimation(
+        fig, update, frames=time_steps, 
+        interval=1000/fps, blit=False, repeat=True
+    )
+    
+    # Save as gif
+    writer = animation.PillowWriter(fps=fps)
+    anim.save(output_path, writer=writer, dpi=dpi)
+    
+    plt.close(fig)
+    print(f"Masked trajectory gif saved to: {output_path}")
