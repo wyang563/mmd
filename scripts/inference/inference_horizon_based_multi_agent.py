@@ -118,6 +118,179 @@ def get_player_masks(past_trajs: List[torch.Tensor], model, model_state):
     masks_torch = torch.from_numpy(masks_np).to(**tensor_args)
     return masks_torch
 
+def create_whole_trajectory_planner(
+    test_config: MultiAgentPlanningSingleTrialConfig,
+):
+    # ============================
+    # Start time per agent.
+    # ============================
+    start_time_l = [i * test_config.stagger_start_time_dt for i in range(test_config.num_agents)]
+
+    # ============================
+    # Arguments for the high/low level planner.
+    # ============================
+    low_level_planner_model_args = {
+        'planner_alg': 'mmd',
+        'use_guide_on_extra_objects_only': params.use_guide_on_extra_objects_only,
+        'n_samples': params.n_samples,
+        'n_local_inference_noising_steps': params.n_local_inference_noising_steps,
+        'n_local_inference_denoising_steps': params.n_local_inference_denoising_steps,
+        'start_guide_steps_fraction': params.start_guide_steps_fraction,
+        'n_guide_steps': params.n_guide_steps,
+        'n_diffusion_steps_without_noise': params.n_diffusion_steps_without_noise,
+        'weight_grad_cost_collision': params.weight_grad_cost_collision,
+        'weight_grad_cost_smoothness': params.weight_grad_cost_smoothness,
+        'weight_grad_cost_constraints': params.weight_grad_cost_constraints,
+        'weight_grad_cost_soft_constraints': params.weight_grad_cost_soft_constraints,
+        'factor_num_interpolated_points_for_collision': params.factor_num_interpolated_points_for_collision,
+        'trajectory_duration': params.trajectory_duration,
+        'device': params.device,
+        'debug': params.debug,
+        'seed': params.seed,
+        'results_dir': params.results_dir,
+        'trained_models_dir': TRAINED_MODELS_DIR,
+    }
+    high_level_planner_model_args = {
+        'is_xcbs': True if test_config.multi_agent_planner_class in ["XECBS", "XCBS"] else False,
+        'is_ecbs': True if test_config.multi_agent_planner_class in ["ECBS", "XECBS"] else False,
+        'start_time_l': start_time_l,
+        'runtime_limit': test_config.runtime_limit,
+        'conflict_type_to_constraint_types': {PointConflict: {MultiPointConstraint}},
+    }
+
+    num_agents = test_config.num_agents
+
+    # ============================
+    # Get planning problem.
+    # ============================
+    # If want to get random starts and goals, then must do that after creating the reference task and robot.
+    start_l = test_config.start_state_pos_l
+    goal_l = test_config.goal_state_pos_l
+    global_model_ids = test_config.global_model_ids
+    agent_skeleton_l = test_config.agent_skeleton_l
+
+    # ============================
+    # Transforms and model tiles setup.
+    # ============================
+    # Create a reference planner from which we'll use the task and robot as the reference on in CBS.
+    # Those are used for collision checking and visualization. This has a skeleton of all tiles.
+    reference_agent_skeleton = [[r, c] for r in range(len(global_model_ids))
+                                for c in range(len(global_model_ids[0]))]
+
+    # ============================
+    # Transforms from tiles to global frame.
+    # ============================
+    tile_width = 2.0
+    tile_height = 2.0
+    global_model_transforms = [[torch.tensor([x * tile_width, -y * tile_height], **tensor_args)
+                                for x in range(len(global_model_ids[0]))] for y in range(len(global_model_ids))]
+
+    # ============================
+    # Parse the single agent planner class name.
+    # ============================
+    if test_config.single_agent_planner_class == "MPD":
+        low_level_planner_class = MPD
+    elif test_config.single_agent_planner_class == "MPDEnsemble":
+        low_level_planner_class = MPDEnsemble
+    else:
+        raise ValueError(f'Unknown single agent planner class: {test_config.single_agent_planner_class}')
+
+    # ============================
+    # Create reference agent planner.
+    # ============================
+    # And for the reference skeleton.
+    reference_task = None
+    reference_robot = None
+    reference_agent_transforms = {}
+    reference_agent_model_ids = {}
+    for skeleton_step in range(len(reference_agent_skeleton)):
+        skeleton_model_coord = reference_agent_skeleton[skeleton_step]
+        reference_agent_transforms[skeleton_step] = global_model_transforms[skeleton_model_coord[0]][
+            skeleton_model_coord[1]]
+        reference_agent_model_ids[skeleton_step] = global_model_ids[skeleton_model_coord[0]][
+            skeleton_model_coord[1]]
+    reference_agent_model_ids = [reference_agent_model_ids[i] for i in range(len(reference_agent_model_ids))]
+    # Create the reference low level planner.
+    print("Creating reference agent stuff.")
+    low_level_planner_model_args['start_state_pos'] = torch.tensor([0.5, 0.9], **tensor_args)  # This does not matter.
+    low_level_planner_model_args['goal_state_pos'] = torch.tensor([-0.5, 0.9], **tensor_args)  # This does not matter.
+    low_level_planner_model_args['model_ids'] = reference_agent_model_ids  # This matters.
+    low_level_planner_model_args['transforms'] = reference_agent_transforms  # This matters.
+
+    if test_config.single_agent_planner_class == "MPD":
+        low_level_planner_model_args['model_id'] = reference_agent_model_ids[0]
+
+    reference_low_level_planner = low_level_planner_class(**low_level_planner_model_args)
+    reference_task = reference_low_level_planner.task
+    reference_robot = reference_low_level_planner.robot
+
+    # ============================
+    # Run trial.
+    # ============================
+    exp_name = f'mmd_single_trial'
+
+    # Transform starts and goals to the global frame. Right now they are in the local tile frames.
+    start_l = [start_l[i] + global_model_transforms[agent_skeleton_l[i][0][0]][agent_skeleton_l[i][0][1]]
+               for i in range(num_agents)]
+    goal_l = [goal_l[i] + global_model_transforms[agent_skeleton_l[i][-1][0]][agent_skeleton_l[i][-1][1]]
+              for i in range(num_agents)]
+
+    # ============================
+    # Create global transforms for each agent's skeleton.
+    # ============================
+    # Each agent has a dict entry. Each entry is a dict with the skeleton steps (0, 1, 2, ...), mapping to the
+    # model transform.
+    agent_model_transforms_l = []
+    agent_model_ids_l = []
+    for agent_id in range(num_agents):
+        agent_model_transforms = {}
+        agent_model_ids = {}
+        for skeleton_step in range(len(agent_skeleton_l[agent_id])):
+            skeleton_model_coord = agent_skeleton_l[agent_id][skeleton_step]
+            agent_model_transforms[skeleton_step] = global_model_transforms[skeleton_model_coord[0]][
+                skeleton_model_coord[1]]
+            agent_model_ids[skeleton_step] = global_model_ids[skeleton_model_coord[0]][skeleton_model_coord[1]]
+        agent_model_transforms_l.append(agent_model_transforms)
+        agent_model_ids_l.append(agent_model_ids)
+    # Change the dict of the model ids to a list sorted by the skeleton steps.
+    agent_model_ids_l = [[agent_model_ids_l[i][j] for j in range(len(agent_model_ids_l[i]))] for i in
+                         range(num_agents)]
+
+    # ============================
+    # Create the low level planners.
+    # ============================
+    planners_creation_start_time = time.time()
+    low_level_planner_l = []
+    for i in range(num_agents):
+        low_level_planner_model_args_i = low_level_planner_model_args.copy()
+        low_level_planner_model_args_i['start_state_pos'] = start_l[i]
+        low_level_planner_model_args_i['goal_state_pos'] = goal_l[i]
+        low_level_planner_model_args_i['model_ids'] = agent_model_ids_l[i]
+        low_level_planner_model_args_i['transforms'] = agent_model_transforms_l[i]
+        if test_config.single_agent_planner_class == "MPD":
+            # Set the model_id to the first one.
+            low_level_planner_model_args_i['model_id'] = agent_model_ids_l[i][0]
+        low_level_planner_l.append(low_level_planner_class(**low_level_planner_model_args_i))
+    print('Planners creation time:', time.time() - planners_creation_start_time)
+    print("\n\n\n\n")
+
+    # ============================
+    # Create the multi agent planner.
+    # ============================
+    if (test_config.multi_agent_planner_class in ["XECBS", "ECBS", "XCBS", "CBS"]):
+        multi_agent_planner_class = CBS
+    elif test_config.multi_agent_planner_class == "PP":
+        multi_agent_planner_class = PrioritizedPlanning
+    else:
+        raise ValueError(f'Unknown multi agent planner class: {test_config.multi_agent_planner_class}')
+    planner = multi_agent_planner_class(low_level_planner_l,
+                                        start_l,
+                                        goal_l,
+                                        reference_task=reference_task,
+                                        reference_robot=reference_robot,
+                                        **high_level_planner_model_args)
+    return planner
+
 def run_horizon_step(
     test_config,
     horizon_start,
@@ -300,17 +473,22 @@ def run_horizon_step(
     # ============================
     # Calculate player masks.
     # ============================
-    player_masks = get_player_masks(past_trajs, model, model_state)
-    player_masks = (player_masks >= 0.5).float()
+    if model is not None:
+        player_masks = get_player_masks(past_trajs, model, model_state)
+        player_masks = (player_masks >= 0.3).float()
+    else:
+        player_masks = None
 
     # ============================
     # Plan.
     # ============================
-    startt = time.time()
-    paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
-        planner.plan(runtime_limit=test_config.runtime_limit)
-    planning_time = time.time() - startt
-    return paths_l, player_masks, num_ct_expansions, trial_success_status, num_collisions_in_solution, planning_time
+    if model is not None:
+        paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
+            planner.plan(runtime_limit=test_config.runtime_limit, mask_l=player_masks)
+    else:
+        paths_l, num_ct_expansions, trial_success_status, num_collisions_in_solution = \
+            planner.plan(runtime_limit=test_config.runtime_limit)
+    return paths_l, player_masks, num_ct_expansions, trial_success_status, num_collisions_in_solution, planner.conflict_search_time 
 
 def generate_intermediate_goals(
     current_start_l,
@@ -389,14 +567,10 @@ def run_multi_agent_trial(
         model_past_horizon: int = 10,
         model_path: str = None,
     ):
+    final_planner = create_whole_trajectory_planner(test_config)
+
     start_l = test_config.start_state_pos_l
     goal_l = test_config.goal_state_pos_l
-
-    # ============================
-    # Create a results directory.
-    # ============================
-    results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
-    os.makedirs(results_dir, exist_ok=True)
 
     # ============================
     # Setup for rendering
@@ -520,7 +694,13 @@ def run_multi_agent_trial(
         extend_amount = min(stride, remaining_timesteps)
         if iteration == 0:
             extend_amount += 1 # account for fact full_trajectories is already padded with initial state
+
         sim_masks.extend([player_masks] * extend_amount)
+        total_planning_time += planning_time
+        total_ct_expansions += num_ct_expansions
+        total_collisions += num_collisions_in_solution
+        if trial_success_status != TrialSuccessStatus.SUCCESS:
+            trial_success_status = TrialSuccessStatus.FAIL_NO_SOLUTION
         
         # condense trajectories and update current_state_l
         num_steps = num_timesteps // stride
@@ -554,18 +734,27 @@ def run_multi_agent_trial(
     # ============================
     # Render trajectories
     # ============================
-    print(f"Final Trajectories: {final_trajectories}")
-    exp_name = 'mmd_horizon_based_trial'
-    if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
-        print(f"\n{CYAN}Rendering trajectories...{RESET}")
-        plot_starts = torch.stack(start_l)
-        plot_goals = torch.stack(goal_l)
-        plot_trajs = torch.stack(final_trajectories)
-        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
-        create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
 
-    else:
-        print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
+
+    # ============================
+    # Create a results directory.
+    # ============================
+    results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
+    os.makedirs(results_dir, exist_ok=True)
+    exp_name = 'mmd_horizon_based_trial'
+
+    # if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
+    #     print(f"\n{CYAN}Rendering trajectories...{RESET}")
+    #     plot_starts = torch.stack(start_l)
+    #     plot_goals = torch.stack(goal_l)
+    #     plot_trajs = torch.stack(final_trajectories)
+    #     create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+    #     if model is not None:
+    #         create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+    #         final_planner.render_paths_masked(final_trajectories, 0, sim_masks, output_fpath=os.path.join(results_dir, f'{exp_name}_planner_visualization_masked.gif'), plot_trajs=True, animation_duration=10)
+
+    # else:
+    #     print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
 
 if __name__ == '__main__':
     test_config_single_tile = MultiAgentPlanningSingleTrialConfig()
@@ -579,7 +768,8 @@ if __name__ == '__main__':
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
     
     player_selection_model_path = "/home/alex/gnn_game_planning/log/gnn_full_MP_2_edge-metric_full_top-k_5/train_n_agents_10_T_50_obs_10_lr_0.0003_bs_32_sigma1_0.11_sigma2_0.11_epochs_50_loss_type_similarity/20251108_103120/psn_best_model.pkl"
-    stride = 16
+    # player_selection_model_path = None
+    stride = 4
 
     example_type = "single_tile"
     # example_type = "multi_tile"
@@ -596,7 +786,7 @@ if __name__ == '__main__':
 
         # Choose starts and goals.
         test_config_single_tile.agent_skeleton_l = [[[0, 0]]] * test_config_single_tile.num_agents
-        # torch.random.manual_seed(10)
+        torch.random.manual_seed(42)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
         get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
                                          EnvDropRegion2D,

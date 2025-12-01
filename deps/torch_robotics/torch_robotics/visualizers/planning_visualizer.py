@@ -139,6 +139,125 @@ class PlanningVisualizer:
 
         create_animation_video(fig, animate_fn, n_frames=n_frames, **kwargs)
 
+    def animate_multi_robot_trajectories_masked(
+            self,
+            trajs_l,
+            start_state_l,
+            goal_state_l,
+            plot_trajs=False,
+            n_frames=10,
+            constraints=None,
+            colors=None,
+            agent_id=None,
+            sim_masks=None,
+            **kwargs
+    ):
+        """
+        Animate multi-robot trajectories with dynamic coloring based on sim_masks.
+        - agent_id: highlighted in blue
+        - agents in sim_masks[agent_id] at each timestep: highlighted in red
+        - all other agents: highlighted in gray
+        """
+        assert trajs_l[0].ndim == 3
+        B, H, D = trajs_l[0].shape
+
+        idxs = np.round(np.linspace(0, H - 1, n_frames)).astype(int)
+        trajs_l_selection = []
+        for trajs in trajs_l:
+            trajs_selection = trajs[:, idxs, :]
+            trajs_l_selection.append(trajs_selection)
+
+        fig, ax = create_fig_and_axes(dim=self.env.dim)
+
+        def get_color_for_agent(i, frame_idx):
+            """Get color for agent i at frame_idx based on masks.
+            
+            sim_masks is a list of length timesteps, where sim_masks[t] is a 
+            (num_agents x num_agents) tensor. sim_masks[t][agent_id][i] is non-zero
+            if agent i is accounted for by agent_id at timestep t.
+            """
+            if i == agent_id:
+                return [0, 0, 1, 1]  # Blue for target agent
+            
+            # Check if this agent is in the mask at this timestep
+            if sim_masks is not None and agent_id is not None:
+                if frame_idx < len(sim_masks):
+                    mask_matrix_at_t = sim_masks[frame_idx]  # shape: (num_agents, num_agents)
+                    # Check if agent i is in the mask for agent_id
+                    if isinstance(mask_matrix_at_t, torch.Tensor):
+                        # Check if sim_masks[t][agent_id][i] is non-zero
+                        if mask_matrix_at_t[agent_id][i] != 0:
+                            return [1, 0, 0, 1]  # Red for agents in mask
+                    elif isinstance(mask_matrix_at_t, np.ndarray):
+                        if mask_matrix_at_t[agent_id][i] != 0:
+                            return [1, 0, 0, 1]  # Red for agents in mask
+            
+            return [0.5, 0.5, 0.5, 1]  # Gray for other agents
+
+        def animate_fn(i):
+            """
+            Draw all the robots at step i for all trajectories.
+            Also add a robot configuration at any constraints.
+            """
+            print(idxs[i], "/", H, end="\r")
+            ax.clear()
+            ax.set_title(f"step: {idxs[i]}/{H-1}")
+            
+            # Get the actual trajectory index (not the frame index)
+            traj_idx = idxs[i]
+            
+            if plot_trajs:
+                # Plot trajectories with dynamic colors
+                for agent_idx, (trajs, start_state, goal_state) in enumerate(zip(trajs_l_selection, start_state_l, goal_state_l)):
+                    agent_color = get_color_for_agent(agent_idx, traj_idx)
+                    self.render_robot_trajectories(
+                        fig=fig,
+                        ax=ax,
+                        trajs=trajs,
+                        start_state=start_state,
+                        goal_state=goal_state,
+                        colors=[agent_color]*len(trajs),
+                        **kwargs
+                    )
+            else:
+                self.env.render(ax)
+
+            # Render each robot at current timestep with dynamic colors
+            for agent_idx, (trajs_selection, start_state, goal_state) in enumerate(zip(trajs_l_selection, start_state_l, goal_state_l)):
+                agent_color = get_color_for_agent(agent_idx, traj_idx)
+                
+                qs = trajs_selection[:, i, :]  # batch, q_dim
+                if qs.ndim == 1:
+                    qs = qs.unsqueeze(0)  # interface (batch, q_dim)
+                for q in qs:
+                    q_tail = []
+                    for di in range(5):
+                        if i - di >= 0:
+                            q_tail.append(trajs_selection[:, i - di, :].squeeze())
+                    kwargs['q_tail'] = q_tail
+                    self.robot.render(
+                        ax, q=q,
+                        color=agent_color,
+                        arrow_length=0.1, arrow_alpha=0.5, arrow_linewidth=1.,
+                        cmap=self.cmaps['collision'] if self.task.compute_collision(q, margin=0.0) else self.cmaps['free'],
+                        **kwargs
+                    )
+
+            # Also add any constraints to the plot, if those exist and are active at this step i.
+            step = idxs[i]
+            if constraints is not None:
+                for constraint in constraints:
+                    # For Constraint object passed.
+                    if constraint.get_t_range()[0] <= step <= constraint.get_t_range()[1]:
+                        self.robot.render(ax, constraint.get_q(), color='red', cmap='Reds')
+
+            # Remove the axes, frame, and title.
+            remove_borders(ax)
+            remove_axes_labels_ticks(ax)
+            ax.set_title('')
+
+        create_animation_video(fig, animate_fn, n_frames=n_frames, **kwargs)
+
     def animate_multi_robot_trajectories(
             self, trajs_l=None, start_state_l=None, goal_state_l=None,
             plot_trajs=False,

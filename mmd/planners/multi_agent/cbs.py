@@ -162,11 +162,13 @@ class CBS:
             raise ValueError('Start or goal states are invalid.')
         # Open list.
         self.open_l = []
+        self.conflict_search_time = 0.0
 
     def get_conflicts(self, state: SearchState) -> List[Conflict]:
         """
         Find conflicts between paths.
         """
+        conflict_search_start_time = time.time()
         # Get a list of best paths from the search state. Each path is shape (H, q_dim).
         best_path_l = [state.path_bl[i][ix_best_path_in_batch].squeeze(0) for i, ix_best_path_in_batch in
                        enumerate(state.ix_best_path_in_batch_l)]
@@ -243,6 +245,7 @@ class CBS:
                                   ],
                                   t_from=int(t_global_from),
                                   t_to=int(t_global_to)))
+        self.conflict_search_time += time.time() - conflict_search_start_time
         return conflicts
 
     def render_paths(self, paths_l: List[torch.Tensor], constraints_l: List[MultiPointConstraint] = None,
@@ -297,6 +300,39 @@ class CBS:
             anim_time=animation_duration,
             constraints=constraints_l,
             colors=self.agent_color_l
+        )
+    
+    def render_paths_masked(self, paths_l: List[torch.Tensor], agent_id: int, sim_masks: List[torch.Tensor], constraints_l: List[MultiPointConstraint] = None,
+                     animation_duration: float = 10.0, output_fpath=None, n_frames=None, plot_trajs=True,
+                     show_robot_in_image=True):
+        # Render
+        planner_visualizer = PlanningVisualizer(
+            task=self.reference_task,
+        )
+
+        # Add batch dimension to all paths.
+        paths_l = [path.unsqueeze(0) for path in paths_l]
+
+        base_file_name = Path(os.path.basename(__file__)).stem
+        if output_fpath is None:
+            output_fpath = os.path.join(self.results_dir, f'{base_file_name}-robot-traj.gif')
+            output_fpath = os.path.abspath(output_fpath)
+
+        # Render the paths.
+        print(f'Rendering paths and saving to: file://{os.path.abspath(output_fpath)}')
+        planner_visualizer.animate_multi_robot_trajectories_masked(
+            trajs_l=paths_l,
+            start_state_l=self.start_state_pos_l,
+            goal_state_l=self.goal_state_pos_l,
+            plot_trajs=plot_trajs,
+            video_filepath=output_fpath,
+            n_frames=max((2, paths_l[0].shape[1])) if n_frames is None else n_frames,
+            # n_frames=pos_trajs_iters[-1].shape[1],
+            anim_time=animation_duration,
+            constraints=constraints_l,
+            colors=self.agent_color_l,
+            agent_id=agent_id,
+            sim_masks=sim_masks
         )
 
     def plan(self, runtime_limit=1000):
@@ -471,6 +507,7 @@ class CBS:
         """
         Create soft constraints from the paths of other agents.
         """
+        start_time = time.time()
         if len(state.path_bl) == 0:
             return []
 
@@ -505,4 +542,5 @@ class CBS:
             soft_constraint.radius_l = radius_l
             soft_constraint.is_soft = True
             agent_constraint_l.append(soft_constraint)
+        self.conflict_search_time += time.time() - start_time
         return agent_constraint_l
