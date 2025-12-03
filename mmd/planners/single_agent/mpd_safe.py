@@ -335,9 +335,15 @@ class MPDSafe(SingleAgentPlanner):
                 if len(constraints[t]) > 0:
                     # Convert list of points to tensor
                     points_tensor = torch.tensor(constraints[t], **self.tensor_args)  # Shape: [n_points, 2]
+                    # Pad to [x, y, 0, 0] to match state_dim for normalization
+                    n_points = points_tensor.shape[0]
+                    zeros_padding = torch.zeros(n_points, self.dataset.state_dim // 2, **self.tensor_args)
+                    points_padded = torch.cat([points_tensor, zeros_padding], dim=-1)  # Shape: [n_points, state_dim]
                     # Normalize using dataset normalizer
-                    points_normalized = self.dataset.normalize_trajectories(points_tensor.unsqueeze(0))  # Add batch dim
+                    points_normalized = self.dataset.normalize_trajectories(points_padded.unsqueeze(0))  # Add batch dim
                     points_normalized = points_normalized.squeeze(0)  # Remove batch dim
+                    # Remove velocity components (keep only first 2 dims: [x, y])
+                    points_normalized = points_normalized[:, :self.dataset.state_dim // 2]  # Shape: [n_points, 2]
                     # Convert back to list
                     constraints_normalized.append(points_normalized.cpu().numpy().tolist())
                 else:
@@ -385,8 +391,8 @@ class MPDSafe(SingleAgentPlanner):
             t_post_diffusion_guide = timer_post_model_sample_guide.elapsed
             print(f't_post_diffusion_guide: {t_post_diffusion_guide:.3f} sec')
 
-        # Remove the extra cost.
-        self.guide.reset_extra_costs()
+        # # Remove the extra cost.
+        # self.guide.reset_extra_costs()
 
         return trajs_normalized_iters, t_model_sampling, t_post_diffusion_guide
 
@@ -401,9 +407,15 @@ class MPDSafe(SingleAgentPlanner):
                 if len(constraints[t]) > 0:
                     # Convert list of points to tensor
                     points_tensor = torch.tensor(constraints[t], **self.tensor_args)  # Shape: [n_points, 2]
+                    # Pad to [x, y, 0, 0] to match state_dim for normalization
+                    n_points = points_tensor.shape[0]
+                    zeros_padding = torch.zeros(n_points, self.dataset.state_dim // 2, **self.tensor_args)
+                    points_padded = torch.cat([points_tensor, zeros_padding], dim=-1)  # Shape: [n_points, state_dim]
                     # Normalize using dataset normalizer
-                    points_normalized = self.dataset.normalize_trajectories(points_tensor.unsqueeze(0))  # Add batch dim
+                    points_normalized = self.dataset.normalize_trajectories(points_padded.unsqueeze(0))  # Add batch dim
                     points_normalized = points_normalized.squeeze(0)  # Remove batch dim
+                    # Remove velocity components (keep only first 2 dims: [x, y])
+                    points_normalized = points_normalized[:, :self.dataset.state_dim // 2]  # Shape: [n_points, 2]
                     # Convert back to list
                     constraints_normalized.append(points_normalized.cpu().numpy().tolist())
                 else:
@@ -456,8 +468,8 @@ class MPDSafe(SingleAgentPlanner):
             t_post_diffusion_guide = timer_post_model_sample_guide.elapsed
             print(f't_post_diffusion_guide: {t_post_diffusion_guide:.3f} sec')
 
-        # Remove the extra cost.
-        self.guide.reset_extra_costs()
+        # # Remove the extra cost.
+        # self.guide.reset_extra_costs()
 
         return trajs_normalized_iters, t_model_sampling, t_post_diffusion_guide
 

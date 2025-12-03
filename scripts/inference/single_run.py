@@ -13,6 +13,7 @@ TRAINED_MODELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '../../data_traine
 # Import MPDSafe
 from mmd.planners.single_agent.mpd_safe import MPDSafe
 from mmd.config.mmd_params import MMDParams as params
+from mmd.utils.plot_trajs import create_single_agent_trajectory_gif_with_constraints
 from torch_robotics.torch_utils.torch_utils import get_torch_device
 
 # Device setup
@@ -99,11 +100,11 @@ def main():
     print("=" * 60)
     
     # Set random seed for reproducibility
-    seed = 42
+    seed = 68 
     
     # Use bounds within [-1, 1] since that's what the trained models expect
     # The user requested [-10, 10] but the models work in normalized coordinates
-    bounds = (-10, 10)  # Slightly inside [-1, 1] to avoid boundary issues
+    bounds = (-0.95, 0.95)  # Slightly inside [-1, 1] to avoid boundary issues
     
     # Create random start and goal
     start_pos, goal_pos = create_random_start_goal(bounds=bounds, seed=seed)
@@ -127,13 +128,16 @@ def main():
     print(f"Trained models directory: {TRAINED_MODELS_DIR}")
     
     # MPDSafe planner arguments
-    planner_args = {
-        'model_id': model_id,
+    low_level_planner_model_args = {
+        "start_state_pos": start_pos,
+        "goal_state_pos": goal_pos,
+        "collision_radius": params.robot_planar_disk_radius * 2,
+        "model_id": model_id,
         'planner_alg': 'mmd',
-        'start_state_pos': start_pos,
-        'goal_state_pos': goal_pos,
-        'collision_radius': params.robot_planar_disk_radius * 2,  # MPDSafe-specific parameter
         'use_guide_on_extra_objects_only': params.use_guide_on_extra_objects_only,
+        'n_samples': params.n_samples,
+        'n_local_inference_noising_steps': params.n_local_inference_noising_steps,
+        'n_local_inference_denoising_steps': params.n_local_inference_denoising_steps,
         'start_guide_steps_fraction': params.start_guide_steps_fraction,
         'n_guide_steps': params.n_guide_steps,
         'n_diffusion_steps_without_noise': params.n_diffusion_steps_without_noise,
@@ -148,9 +152,6 @@ def main():
         'seed': params.seed,
         'results_dir': params.results_dir,
         'trained_models_dir': TRAINED_MODELS_DIR,
-        'n_samples': 16,  # Reduced for faster testing
-        'n_local_inference_noising_steps': params.n_local_inference_noising_steps,
-        'n_local_inference_denoising_steps': params.n_local_inference_denoising_steps,
     }
     
     print("\n" + "=" * 60)
@@ -159,7 +160,7 @@ def main():
     
     try:
         # Create the MPDSafe planner
-        planner = MPDSafe(**planner_args)
+        planner = MPDSafe(**low_level_planner_model_args)
         print("MPDSafe planner created successfully!")
         
         print("\n" + "=" * 60)
@@ -189,8 +190,47 @@ def main():
             print("WARNING: No collision-free trajectories found!")
         
         print("\n" + "=" * 60)
-        print("Test completed successfully!")
+        print("Plotting Trajectories...")
         print("=" * 60)
+
+        # Get the best trajectory
+        if result.trajs_final_free is not None and result.trajs_final_free.shape[0] > 0:
+            # Use the best collision-free trajectory
+            if result.idx_best_free_traj is not None:
+                best_traj = result.trajs_final_free[result.idx_best_free_traj]  # Shape: [H, D]
+            else:
+                # Use first collision-free trajectory if no best index
+                best_traj = result.trajs_final_free[0]  # Shape: [H, D]
+        else:
+            # Fall back to best trajectory from all trajectories
+            if result.idx_best_traj is not None:
+                best_traj = result.trajs_final[result.idx_best_traj]  # Shape: [H, D]
+            else:
+                # Use first trajectory if no best index
+                best_traj = result.trajs_final[0]  # Shape: [H, D]
+        
+        # Create output directory if it doesn't exist
+        output_dir = params.results_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create the gif with constraints
+        output_path = os.path.join(output_dir, 'single_agent_trajectory_with_constraints.gif')
+        print(f"Creating trajectory GIF with constraints at: {output_path}")
+        create_single_agent_trajectory_gif_with_constraints(
+            trajectory=best_traj,
+            start=start_pos,
+            goal=goal_pos,
+            constraints=constraints_3d,
+            output_path=output_path,
+            fps=10,
+            figsize=(10, 10),
+            agent_radius=params.robot_planar_disk_radius,
+            constraint_radius=params.robot_planar_disk_radius * 2,  # Constraint radius is 2x agent radius
+            show_velocity_arrows=False,
+            title="Single Agent Trajectory with Constraints",
+            dpi=300
+        )
+        print(f"Trajectory GIF with constraints saved successfully!")
         
     except Exception as e:
         print(f"\nERROR: {type(e).__name__}: {e}")

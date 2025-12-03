@@ -495,3 +495,257 @@ def create_masked_trajectory_gif(
     
     plt.close(fig)
     print(f"Masked trajectory gif saved to: {output_path}")
+
+
+def create_single_agent_trajectory_gif_with_constraints(
+    trajectory,
+    start,
+    goal,
+    constraints,
+    output_path: str,
+    fps: int = 10,
+    figsize: Tuple[int, int] = (10, 10),
+    agent_radius: float = 0.05,
+    constraint_radius: float = 0.1,
+    show_velocity_arrows: bool = False,
+    title: Optional[str] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    dpi: int = 300
+) -> None:
+    """
+    Create a gif animation of a single agent trajectory with constraint points.
+    
+    Constraint points appear at their specified timesteps and remain visible.
+    
+    Parameters
+    ----------
+    trajectory : np.ndarray or torch.Tensor
+        Trajectory array of shape (time_steps, 4) or (time_steps, 2) where:
+        - If shape is (time_steps, 4): (px, py, vx, vy) - position and velocity
+        - If shape is (time_steps, 2): (px, py) - position only
+    start : np.ndarray or torch.Tensor
+        Start position of shape (2,) containing (x, y) coordinates
+    goal : np.ndarray or torch.Tensor
+        Goal position of shape (2,) containing (x, y) coordinates
+    constraints : list of list of list
+        Constraints as a 3D list indexed by [timestep][point_idx][coord].
+        Format: constraints[timestep][point_idx][coord] where:
+        - timestep: time step index (0 to time_steps-1)
+        - point_idx: index of constraint point at that timestep
+        - coord: [x, y] coordinates of the constraint point
+        Each timestep can have zero or more constraint points.
+    output_path : str
+        Path to save the output gif file
+    fps : int, optional
+        Frames per second for the gif, by default 10
+    figsize : Tuple[int, int], optional
+        Figure size in inches, by default (10, 10)
+    agent_radius : float, optional
+        Radius of agent circle in the plot, by default 0.05
+    constraint_radius : float, optional
+        Radius of constraint point circles, by default 0.1
+    show_velocity_arrows : bool, optional
+        Whether to show velocity arrows, by default False
+    title : Optional[str], optional
+        Title for the plot, by default None
+    xlim : Optional[Tuple[float, float]], optional
+        X-axis limits, by default None (auto-computed from data)
+    ylim : Optional[Tuple[float, float]], optional
+        Y-axis limits, by default None (auto-computed from data)
+    dpi : int, optional
+        DPI for the output gif, by default 300
+    """
+    # Convert torch tensors to numpy arrays if needed
+    if hasattr(trajectory, 'cpu'):
+        trajectory = trajectory.cpu().detach().numpy()
+    elif not isinstance(trajectory, np.ndarray):
+        trajectory = np.array(trajectory)
+    
+    if hasattr(start, 'cpu'):
+        start = start.cpu().detach().numpy()
+    elif not isinstance(start, np.ndarray):
+        start = np.array(start)
+    
+    if hasattr(goal, 'cpu'):
+        goal = goal.cpu().detach().numpy()
+    elif not isinstance(goal, np.ndarray):
+        goal = np.array(goal)
+    
+    # Ensure trajectory is 2D
+    if trajectory.ndim == 1:
+        trajectory = trajectory.reshape(1, -1)
+    
+    time_steps, traj_dim = trajectory.shape
+    
+    # Handle trajectory dimensions - add velocity if needed
+    if traj_dim == 2:
+        # Only position, add zero velocity
+        positions = trajectory
+        velocities = np.zeros_like(positions)
+        if time_steps > 1:
+            # Compute velocity from finite differences
+            velocities[:-1] = positions[1:] - positions[:-1]
+            velocities[-1] = velocities[-2] if time_steps > 1 else velocities[0]
+        trajectory_full = np.concatenate([positions, velocities], axis=-1)
+    elif traj_dim == 4:
+        # Already has position and velocity
+        trajectory_full = trajectory
+    else:
+        raise ValueError(f"Unexpected trajectory dimension: {traj_dim}. Expected 2 (position) or 4 (position+velocity).")
+    
+    # Ensure start and goal are 1D arrays of length 2
+    start = np.array(start).flatten()[:2]
+    goal = np.array(goal).flatten()[:2]
+    
+    # Normalize constraints format - ensure it's a list of lists
+    # Convert constraints to a more usable format: list of (timestep, point) tuples
+    constraint_points = []  # List of (timestep, x, y) tuples
+    for t in range(len(constraints)):
+        if t < time_steps:  # Only process constraints within trajectory length
+            for point in constraints[t]:
+                if len(point) >= 2:
+                    constraint_points.append((t, float(point[0]), float(point[1])))
+    
+    # Set up the figure and axis
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Compute axis limits if not provided
+    if xlim is None:
+        all_x = [trajectory_full[:, 0], start[0], goal[0]]
+        for _, x, _ in constraint_points:
+            all_x.append(x)
+        all_x = np.concatenate([np.array(x).flatten() for x in all_x])
+        if len(all_x) > 0:
+            x_margin = (all_x.max() - all_x.min()) * 0.1 if all_x.max() != all_x.min() else 0.1
+            xlim = (all_x.min() - x_margin, all_x.max() + x_margin)
+        else:
+            xlim = (-1, 1)
+    
+    if ylim is None:
+        all_y = [trajectory_full[:, 1], start[1], goal[1]]
+        for _, _, y in constraint_points:
+            all_y.append(y)
+        all_y = np.concatenate([np.array(y).flatten() for y in all_y])
+        if len(all_y) > 0:
+            y_margin = (all_y.max() - all_y.min()) * 0.1 if all_y.max() != all_y.min() else 0.1
+            ylim = (all_y.min() - y_margin, all_y.max() + y_margin)
+        else:
+            ylim = (-1, 1)
+    
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X Position')
+    ax.set_ylabel('Y Position')
+    
+    if title:
+        ax.set_title(title)
+    else:
+        ax.set_title('Single Agent Trajectory with Constraints')
+    
+    # Plot start and goal positions (static elements)
+    agent_color = 'blue'
+    constraint_color = 'red'
+    
+    # Start position (circle marker)
+    ax.plot(start[0], start[1], 'o', color=agent_color, markersize=12, zorder=5, label='Start')
+    ax.text(start[0], start[1], 'S', color='white', fontsize=8, fontweight='bold', 
+            ha='center', va='center', zorder=6)
+    
+    # Goal position (star marker)
+    ax.plot(goal[0], goal[1], '*', color=agent_color, markersize=20, zorder=5, label='Goal')
+    ax.text(goal[0], goal[1], 'G', color='white', fontsize=8, fontweight='bold', 
+            ha='center', va='center', zorder=6)
+    
+    # Initialize trajectory line and agent circle
+    trajectory_line, = ax.plot([], [], '-', color=agent_color, linewidth=2, alpha=0.6, zorder=3, label='Trajectory')
+    agent_circle = Circle((0, 0), agent_radius, color=agent_color, alpha=0.8, zorder=10)
+    ax.add_patch(agent_circle)
+    
+    # Initialize constraint circles (will be added dynamically)
+    constraint_circles = []
+    
+    # Velocity arrow (optional) - use a list to store it so it can be modified in update
+    velocity_arrow_list = [None]
+    if show_velocity_arrows:
+        velocity_arrow_list[0] = ax.arrow(0, 0, 0, 0, head_width=0.3, head_length=0.3, 
+                                          fc=agent_color, ec=agent_color, alpha=0.7, zorder=8)
+    
+    # Time text
+    time_text = ax.text(0.02, 0.98, '', transform=ax.transAxes, 
+                       verticalalignment='top', fontsize=12,
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Add legend
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', label='Start',
+                   markerfacecolor=agent_color, markersize=10),
+        plt.Line2D([0], [0], marker='*', color='w', label='Goal',
+                   markerfacecolor=agent_color, markersize=15),
+        plt.Line2D([0], [0], color=agent_color, label='Trajectory', linewidth=2),
+        plt.Line2D([0], [0], marker='o', color='w', label='Constraint',
+                   markerfacecolor=constraint_color, markersize=10)
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+    
+    # Animation update function
+    def update(frame):
+        # Update trajectory line (show path up to current frame)
+        traj_x = trajectory_full[:frame+1, 0]
+        traj_y = trajectory_full[:frame+1, 1]
+        trajectory_line.set_data(traj_x, traj_y)
+        
+        # Update agent position
+        current_x = trajectory_full[frame, 0]
+        current_y = trajectory_full[frame, 1]
+        agent_circle.center = (current_x, current_y)
+        
+        # Remove old constraint circles from previous frames
+        for circle in constraint_circles:
+            if circle in ax.patches:
+                circle.remove()
+        constraint_circles.clear()
+        
+        # Add constraint points that appear ONLY at this exact timestep
+        for t, x, y in constraint_points:
+            if t == frame:  # Only show constraint at its exact timestep
+                circle = Circle((x, y), constraint_radius, color=constraint_color, 
+                               alpha=0.6, zorder=7, edgecolor='darkred', linewidth=1.5)
+                ax.add_patch(circle)
+                constraint_circles.append(circle)
+        
+        # Update velocity arrow if enabled
+        if show_velocity_arrows and frame < time_steps:
+            vx = trajectory_full[frame, 2]
+            vy = trajectory_full[frame, 3]
+            if velocity_arrow_list[0] is not None and velocity_arrow_list[0] in ax.patches:
+                velocity_arrow_list[0].remove()
+            
+            velocity_arrow_list[0] = ax.arrow(current_x, current_y, vx, vy, 
+                                             head_width=0.3, head_length=0.3,
+                                             fc=agent_color, ec=agent_color, 
+                                             alpha=0.7, zorder=8)
+            ax.add_patch(velocity_arrow_list[0])
+        
+        # Update time text
+        time_text.set_text(f'Time Step: {frame}/{time_steps-1}')
+        
+        artists = [trajectory_line, agent_circle, time_text] + constraint_circles
+        if show_velocity_arrows and velocity_arrow_list[0] is not None:
+            artists.append(velocity_arrow_list[0])
+        return artists
+    
+    # Create animation
+    anim = animation.FuncAnimation(
+        fig, update, frames=time_steps, 
+        interval=1000/fps, blit=False, repeat=True
+    )
+    
+    # Save as gif
+    writer = animation.PillowWriter(fps=fps)
+    anim.save(output_path, writer=writer, dpi=dpi)
+    
+    plt.close(fig)
+    print(f"Single agent trajectory gif with constraints saved to: {output_path}")

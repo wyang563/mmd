@@ -786,7 +786,7 @@ if __name__ == '__main__':
 
         # Choose starts and goals.
         test_config_single_tile.agent_skeleton_l = [[[0, 0]]] * test_config_single_tile.num_agents
-        torch.random.manual_seed(42)
+        torch.random.manual_seed(43)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
         get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
                                          EnvDropRegion2D,

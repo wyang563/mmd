@@ -6,3 +6,4 @@ deps/
 results/
 **__pycache__**
 out.txt
+logs/*

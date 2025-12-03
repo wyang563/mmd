@@ -47,11 +47,10 @@ def extract(a, t, x_shape):
 def safe_sample_fn(
         model, x, hard_conds, context, t,
         constraints=None,
-        scale_grad_by_std=False,
+        noise_std_extra_schedule_fn=None,  # 'linear'
         debug=False,
         **kwargs
 ):
-    print()
     if constraints is None:
         raise ValueError("Constraints are required for safe sampling.")
 
@@ -65,18 +64,20 @@ def safe_sample_fn(
 
     model_log_variance = extract(model.posterior_log_variance_clipped, t, x.shape)
     model_std = torch.exp(0.5 * model_log_variance)
-    model_var = torch.exp(model_log_variance)
-    
-    # TODO: Apply constraints here (e.g., CBF-based modifications)
-    # For now, just return x similar to ddpm_sample_fn
-    # Constraints should be in normalized space [-1, 1] and used to modify x
-    
     noise = torch.randn_like(x)
+
     # No noise when t = 0.
     noise[t == 0] = 0
-    
+
+    # For smoother results, we can decay the noise standard deviation throughout the diffusion
+    # this is roughly equivalent to using a temperature in the prior distribution
+    if noise_std_extra_schedule_fn is None:
+        noise_std = 1.0
+    else:
+        noise_std = noise_std_extra_schedule_fn(t_single)
+
     values = None
-    return x + model_std * noise, values
+    return x + model_std * noise * noise_std, values   
 
 @torch.no_grad()
 def ddpm_sample_fn(
