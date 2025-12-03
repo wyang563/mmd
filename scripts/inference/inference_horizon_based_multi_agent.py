@@ -77,7 +77,7 @@ import numpy as np
 # Import from train_gnn using importlib to avoid modifying sys.path
 import importlib.util
 import sys as _sys
-_train_gnn_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../src/models/train_gnn.py'))
+_train_gnn_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../models/train_gnn.py'))
 _spec = importlib.util.spec_from_file_location("train_gnn", _train_gnn_path)
 _train_gnn_module = importlib.util.module_from_spec(_spec)
 _sys.modules["train_gnn"] = _train_gnn_module
@@ -743,22 +743,22 @@ def run_multi_agent_trial(
     os.makedirs(results_dir, exist_ok=True)
     exp_name = 'mmd_horizon_based_trial'
 
-    # if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
-    #     print(f"\n{CYAN}Rendering trajectories...{RESET}")
-    #     plot_starts = torch.stack(start_l)
-    #     plot_goals = torch.stack(goal_l)
-    #     plot_trajs = torch.stack(final_trajectories)
-    #     create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
-    #     if model is not None:
-    #         create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
-    #         final_planner.render_paths_masked(final_trajectories, 0, sim_masks, output_fpath=os.path.join(results_dir, f'{exp_name}_planner_visualization_masked.gif'), plot_trajs=True, animation_duration=10)
+    if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
+        print(f"\n{CYAN}Rendering trajectories...{RESET}")
+        plot_starts = torch.stack(start_l)
+        plot_goals = torch.stack(goal_l)
+        plot_trajs = torch.stack(final_trajectories)
+        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+        if model is not None:
+            create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+            final_planner.render_paths_masked(final_trajectories, 0, sim_masks, output_fpath=os.path.join(results_dir, f'{exp_name}_planner_visualization_masked.gif'), plot_trajs=True, animation_duration=10)
 
-    # else:
-    #     print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
+    else:
+        print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
 
 if __name__ == '__main__':
     test_config_single_tile = MultiAgentPlanningSingleTrialConfig()
-    test_config_single_tile.num_agents = 15 
+    test_config_single_tile.num_agents = 5 
     test_config_single_tile.instance_name = "test"
     test_config_single_tile.multi_agent_planner_class = "XECBS"  # Or "ECBS" or "XCBS" or "CBS" or "PP".
     test_config_single_tile.single_agent_planner_class = "MPDEnsemble"  # Or "MPD"
@@ -767,7 +767,7 @@ if __name__ == '__main__':
     test_config_single_tile.time_str = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
     
-    player_selection_model_path = "/home/alex/gnn_game_planning/log/gnn_full_MP_2_edge-metric_full_top-k_5/train_n_agents_10_T_50_obs_10_lr_0.0003_bs_32_sigma1_0.11_sigma2_0.11_epochs_50_loss_type_similarity/20251108_103120/psn_best_model.pkl"
+    player_selection_model_path = "/home/alex/gnn_game_planning/log/point_agent_train_runs/gnn_full_MP_2_edge-metric_full_top-k_5/train_n_agents_10_T_50_obs_10_lr_0.0003_bs_32_sigma1_0.11_sigma2_0.11_epochs_50_loss_type_similarity/20251108_103120/psn_best_model.pkl"
     # player_selection_model_path = None
     stride = 4
 

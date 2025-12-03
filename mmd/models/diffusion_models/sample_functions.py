@@ -1,8 +1,14 @@
 """
 Modified from https://github.com/jacarvalho/mpd-public
+Extended with SafeDiffuser CBF-based trajectory modifications.
+
+References:
+- SafeDiffuser: Safe Planning with Diffusion Probabilistic Models via Control Barrier Functions
+  https://arxiv.org/abs/2306.00148
 """
 import torch
-from matplotlib import pyplot as plt
+from typing import List, Optional, Tuple
+from dataclasses import dataclass
 
 
 def apply_hard_conditioning(x, conditions):
@@ -36,6 +42,41 @@ def extract(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+
+@torch.no_grad()
+def safe_sample_fn(
+        model, x, hard_conds, context, t,
+        constraints=None,
+        scale_grad_by_std=False,
+        debug=False,
+        **kwargs
+):
+    print()
+    if constraints is None:
+        raise ValueError("Constraints are required for safe sampling.")
+
+    t_single = t[0]
+    # By convention, a time less than zero gets zero noise. That is, sampling to update mean is computed to until t=0 and then only guidance and sampling, without updating the mean, is done.
+    if t_single < 0:
+        t = torch.zeros_like(t)
+
+    model_mean, _, model_log_variance = model.p_mean_variance(x=x, hard_conds=hard_conds, context=context, t=t)
+    x = model_mean
+
+    model_log_variance = extract(model.posterior_log_variance_clipped, t, x.shape)
+    model_std = torch.exp(0.5 * model_log_variance)
+    model_var = torch.exp(model_log_variance)
+    
+    # TODO: Apply constraints here (e.g., CBF-based modifications)
+    # For now, just return x similar to ddpm_sample_fn
+    # Constraints should be in normalized space [-1, 1] and used to modify x
+    
+    noise = torch.randn_like(x)
+    # No noise when t = 0.
+    noise[t == 0] = 0
+    
+    values = None
+    return x + model_std * noise, values
 
 @torch.no_grad()
 def ddpm_sample_fn(
@@ -95,13 +136,15 @@ def guide_gradient_steps(
         debug=False,
         **kwargs
 ):
-    for _ in range(n_guide_steps):
-        grad_scaled = guide(x)
+    if guide is not None:
+        for _ in range(n_guide_steps):
+            grad_scaled = guide(x)
 
-        if scale_grad_by_std:
-            grad_scaled = model_var * grad_scaled
+            if scale_grad_by_std:
+                grad_scaled = model_var * grad_scaled
 
-        x = x + grad_scaled
+            x = x + grad_scaled
+            x = apply_hard_conditioning(x, hard_conds)
+    else:
         x = apply_hard_conditioning(x, hard_conds)
-
     return x

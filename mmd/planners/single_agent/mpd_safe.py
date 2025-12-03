@@ -38,7 +38,9 @@ from experiment_launcher import single_experiment_yaml, run_experiment
 from mp_baselines.planners.costs.cost_functions import CostCollision, CostComposite, CostGPTrajectory, CostConstraint, CostMaxVelocity
 from mmd.models import TemporalUnet, UNET_DIM_MULTS
 from mmd.models.diffusion_models.guides import GuideManagerTrajectoriesWithVelocity
-from mmd.models.diffusion_models.sample_functions import guide_gradient_steps, ddpm_sample_fn
+from mmd.models.diffusion_models.sample_functions import (
+    guide_gradient_steps, ddpm_sample_fn, safe_sample_fn
+)
 from mmd.trainer import get_dataset, get_model
 from mmd.utils.loading import load_params_from_yaml
 from torch_robotics.robots import *
@@ -55,7 +57,7 @@ from mmd.common.constraints import MultiPointConstraint
 from mmd.common.pretty_print import *
 
 
-class MPD(SingleAgentPlanner):
+class MPDSafe(SingleAgentPlanner):
     """
     A class that allows repeated calls to the same model with different inputs.
     This class keeps track of constraints and feeds them to the model only when needed.
@@ -66,6 +68,7 @@ class MPD(SingleAgentPlanner):
                  planner_alg: str,
                  start_state_pos: torch.tensor,
                  goal_state_pos: torch.tensor,
+                 collision_radius: float,
                  use_guide_on_extra_objects_only: bool,
                  start_guide_steps_fraction: float,
                  n_guide_steps: int,
@@ -209,63 +212,6 @@ class MPD(SingleAgentPlanner):
         hard_conds = dataset.get_hard_conditions(torch.vstack((start_state_pos, goal_state_pos)), normalize=True)
         context = None
 
-        ########
-        # Set up the planning costs
-        # Cost collisions
-        cost_collision_l = []
-        weights_grad_cost_l = []  # for guidance, the weights_cost_l are the gradient multipliers (after gradient clipping)
-        if use_guide_on_extra_objects_only:
-            collision_fields = task.get_collision_fields_extra_objects()
-        else:
-            collision_fields = task.get_collision_fields()
-
-        for collision_field in collision_fields:
-            cost_collision_l.append(
-                CostCollision(
-                    robot, n_support_points,
-                    field=collision_field,
-                    sigma_coll=1.0,
-                    tensor_args=tensor_args
-                )
-            )
-            weights_grad_cost_l.append(weight_grad_cost_collision)
-
-        # Cost smoothness
-        cost_smoothness_l = [
-            CostGPTrajectory(
-                robot, n_support_points, dt, sigma_gp=1.0,
-                tensor_args=tensor_args
-            )
-        ]
-        weights_grad_cost_l.append(weight_grad_cost_smoothness)
-
-        ####### Cost composition
-        cost_func_list = [
-            *cost_collision_l,
-            *cost_smoothness_l,
-            # *cost_max_velocity_l,
-        ]
-        # A `*cost_constraints_l` will be added as "extra cost" and removed after each planning call.
-
-        cost_composite = CostComposite(
-            robot, n_support_points, cost_func_list,
-            weights_cost_l=weights_grad_cost_l,
-            tensor_args=tensor_args
-        )
-
-        ########
-        # Guiding manager
-        guide = GuideManagerTrajectoriesWithVelocity(
-            dataset,
-            cost_composite,
-            clip_grad=True,
-            interpolate_trajectories_for_collision=True,
-            num_interpolated_points=ceil(n_support_points * factor_num_interpolated_points_for_collision),
-            tensor_args=tensor_args,
-        )
-
-        t_start_guide = ceil(start_guide_steps_fraction * model.n_diffusion_steps)
-
         # Keep some variables in the class as members.
         self.start_state_pos = torch.clone(start_state_pos)
         self.goal_state_pos = torch.clone(goal_state_pos)
@@ -277,10 +223,10 @@ class MPD(SingleAgentPlanner):
         self.hard_conds = hard_conds
         self.model = model
         self.n_support_points = n_support_points
-        self.t_start_guide = t_start_guide
         self.n_guide_steps = n_guide_steps
-        self.guide = guide
         self.tensor_args = tensor_args
+        self.collision_radius = collision_radius
+
         # Batch-size. How many trajectories to generate at once.
         self.num_samples = n_samples
         # When doing local inference, how many steps to add noise for before denoising again.
@@ -297,13 +243,9 @@ class MPD(SingleAgentPlanner):
         self.recent_call_data = PlannerOutput()
 
         self.sample_fn_kwargs = dict(
-                 guide=None if self.run_prior_then_guidance or self.run_prior_only else self.guide,
-                 n_guide_steps=self.n_guide_steps,
-                 t_start_guide=self.t_start_guide,
-                 noise_std_extra_schedule_fn=lambda x: 0.5,
         )
 
-    def __call__(self, start_state_pos, goal_state_pos, constraints_l=None, experience: PathBatchExperience = None, use_qpth: bool = False,
+    def __call__(self, start_state_pos, goal_state_pos, constraints=None, experience: PathBatchExperience = None, use_qpth: bool = False,
                  *args,
                  **kwargs):
         """
@@ -320,34 +262,14 @@ class MPD(SingleAgentPlanner):
         if not torch.allclose(goal_state_pos, self.goal_state_pos):
             raise ValueError("The goal state is different from the one stored in the planner.")
 
-        # Process the constraints into cost components.
-        if constraints_l is not None:
-            print("Planning with " + str(len(constraints_l)) + " constraints.")
-        else:
-            print("Planning without constraints.")
-
-        cost_constraints_l = []
-        if constraints_l is not None:
-            for c in constraints_l:
-                cost_constraints_l.append(
-                    CostConstraint(
-                        self.robot,
-                        self.n_support_points,
-                        q_l=c.get_q_l(),
-                        traj_range_l=c.get_t_range_l(),
-                        radius_l=c.radius_l,
-                        is_soft=c.is_soft,
-                        tensor_args=self.tensor_args
-                    )
-                )
         # Carry out inference with the constraints. If there is no experience, inference from scratch.
         with TimerCUDA() as timer_inference:
             if experience is None:
                 trajs_normalized_iters, _, _ = self.run_constrained_inference(
-                    cost_constraints_l)  # Shape [B (n_samples), H, D]
+                    constraints)  # Shape [B (n_samples), H, D]
             # Otherwise, use the experience path as a seed for a local inference call.
             else:
-                trajs_normalized_iters, _, _ = self.run_constrained_local_inference(cost_constraints_l, experience)
+                trajs_normalized_iters, _, _ = self.run_constrained_local_inference(constraints, experience)
         t_total = timer_inference.elapsed
 
         # Un-normalize trajectory samples from the models.
@@ -396,7 +318,6 @@ class MPD(SingleAgentPlanner):
         self.recent_call_data.cost_path_length = cost_path_length
         self.recent_call_data.cost_all = cost_all
         self.recent_call_data.variance_waypoint_trajs_final_free = variance_waypoint_trajs_final_free
-        self.recent_call_data.constraints_l = constraints_l
 
         # Smooth the trajectories in trajs_final.
         if self.recent_call_data.trajs_final is not None:
@@ -404,12 +325,23 @@ class MPD(SingleAgentPlanner):
 
         return self.recent_call_data
 
-    def run_constrained_inference(self, cost_constraints_l: List[CostConstraint]):
-        # Add these cost factors, alongside their weights as specified, to the `guide` object of the model.
-        self.guide.add_extra_costs(cost_constraints_l,
-                                   [self.weight_grad_cost_soft_constraints if c.is_soft else
-                                    self.weight_grad_cost_constraints
-                                    for c in cost_constraints_l])
+    def run_constrained_inference(self, constraints):
+        # Normalize constraints if they are provided and in robot space
+        # Constraints format: constraints_3d[timestep][point_idx][coord]
+        constraints_normalized = None
+        if constraints is not None:
+            constraints_normalized = []
+            for t in range(len(constraints)):
+                if len(constraints[t]) > 0:
+                    # Convert list of points to tensor
+                    points_tensor = torch.tensor(constraints[t], **self.tensor_args)  # Shape: [n_points, 2]
+                    # Normalize using dataset normalizer
+                    points_normalized = self.dataset.normalize_trajectories(points_tensor.unsqueeze(0))  # Add batch dim
+                    points_normalized = points_normalized.squeeze(0)  # Remove batch dim
+                    # Convert back to list
+                    constraints_normalized.append(points_normalized.cpu().numpy().tolist())
+                else:
+                    constraints_normalized.append([])
 
         # Sample trajectories with the diffusion/cvae model
         with TimerCUDA() as timer_model_sampling:
@@ -417,7 +349,8 @@ class MPD(SingleAgentPlanner):
                 self.context, self.hard_conds,
                 n_samples=self.num_samples, horizon=self.n_support_points,
                 return_chain=True,
-                sample_fn=ddpm_sample_fn,
+                sample_fn=safe_sample_fn,
+                constraints=constraints_normalized,
                 **self.sample_fn_kwargs,
                 n_diffusion_steps_without_noise=self.n_diffusion_steps_without_noise,
                 # ddim=True
@@ -457,13 +390,24 @@ class MPD(SingleAgentPlanner):
 
         return trajs_normalized_iters, t_model_sampling, t_post_diffusion_guide
 
-    def run_constrained_local_inference(self, cost_constraints_l: List[CostConstraint],
+    def run_constrained_local_inference(self, constraints,
                                         experience: PathBatchExperience):
-        # Add these cost factors, alongside their weights as specified, to the `guide` object of the model.
-        self.guide.add_extra_costs(cost_constraints_l,
-                                   [self.weight_grad_cost_soft_constraints if c.is_soft else
-                                    self.weight_grad_cost_constraints
-                                    for c in cost_constraints_l])
+        # Normalize constraints if they are provided and in robot space
+        # Constraints format: constraints_3d[timestep][point_idx][coord]
+        constraints_normalized = None
+        if constraints is not None:
+            constraints_normalized = []
+            for t in range(len(constraints)):
+                if len(constraints[t]) > 0:
+                    # Convert list of points to tensor
+                    points_tensor = torch.tensor(constraints[t], **self.tensor_args)  # Shape: [n_points, 2]
+                    # Normalize using dataset normalizer
+                    points_normalized = self.dataset.normalize_trajectories(points_tensor.unsqueeze(0))  # Add batch dim
+                    points_normalized = points_normalized.squeeze(0)  # Remove batch dim
+                    # Convert back to list
+                    constraints_normalized.append(points_normalized.cpu().numpy().tolist())
+                else:
+                    constraints_normalized.append([])
 
         # Sample trajectories with the diffusion/cvae model
         with TimerCUDA() as timer_model_sampling:
@@ -476,7 +420,8 @@ class MPD(SingleAgentPlanner):
                 n_samples=self.num_samples,
                 horizon=self.n_support_points,
                 return_chain=True,
-                sample_fn=ddpm_sample_fn,
+                sample_fn=safe_sample_fn,
+                constraints=constraints_normalized,
                 **self.sample_fn_kwargs,
                 n_diffusion_steps_without_noise=self.n_diffusion_steps_without_noise,
                 # ddim=True

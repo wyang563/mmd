@@ -17,11 +17,15 @@ from abc import ABC
 from torch.nn import DataParallel
 
 from mmd.models.diffusion_models.helpers import cosine_beta_schedule, Losses, exponential_beta_schedule
-from mmd.models.diffusion_models.sample_functions import extract, apply_hard_conditioning, apply_cross_conditioning, guide_gradient_steps, \
+from mmd.models.diffusion_models.sample_functions import (
+    extract, apply_hard_conditioning, apply_cross_conditioning, guide_gradient_steps,
     ddpm_sample_fn
+)
+
 from mmd.common.pretty_print import *
 from torch_robotics.torch_utils.torch_timer import TimerCUDA
 from torch_robotics.torch_utils.torch_utils import to_numpy
+from qpth.qp import QPFunction, QPSolvers
 
 
 def make_timesteps(batch_size, i, device):
