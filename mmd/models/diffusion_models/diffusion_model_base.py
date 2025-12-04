@@ -202,7 +202,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
         for i in reversed(range(-n_diffusion_steps_without_noise, n_diffusion_steps)):
             t = make_timesteps(batch_size, i, device)
-            x, values = sample_fn(self, x, hard_conds, context, t, **sample_kwargs)
+            x, _ = sample_fn(self, x, hard_conds, context, t, **sample_kwargs)
             x = apply_hard_conditioning(x, hard_conds)
 
             if return_chain:

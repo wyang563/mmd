@@ -693,9 +693,8 @@ def create_single_agent_trajectory_gif_with_constraints(
     # Animation update function
     def update(frame):
         # Update trajectory line (show path up to current frame)
-        traj_x = trajectory_full[:frame+1, 0]
-        traj_y = trajectory_full[:frame+1, 1]
-        trajectory_line.set_data(traj_x, traj_y)
+        # Set to empty arrays to prevent drawing the trajectory trace
+        trajectory_line.set_data([], [])
         
         # Update agent position
         current_x = trajectory_full[frame, 0]

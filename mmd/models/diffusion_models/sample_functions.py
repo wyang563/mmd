@@ -9,7 +9,7 @@ References:
 import torch
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
-
+from mmd.models.diffusion_models.safe_diffuser_guides import invariance_time
 
 def apply_hard_conditioning(x, conditions):
     for t, val in conditions.items():
@@ -48,6 +48,7 @@ def safe_sample_fn(
         model, x, hard_conds, context, t,
         constraints=None,
         noise_std_extra_schedule_fn=None,  # 'linear'
+        safe_diffuser_guide_func=invariance_time,
         debug=False,
         **kwargs
 ):
@@ -60,7 +61,6 @@ def safe_sample_fn(
         t = torch.zeros_like(t)
 
     model_mean, _, model_log_variance = model.p_mean_variance(x=x, hard_conds=hard_conds, context=context, t=t)
-    x = model_mean
 
     model_log_variance = extract(model.posterior_log_variance_clipped, t, x.shape)
     model_std = torch.exp(0.5 * model_log_variance)
@@ -77,7 +77,9 @@ def safe_sample_fn(
         noise_std = noise_std_extra_schedule_fn(t_single)
 
     values = None
-    return x + model_std * noise * noise_std, values   
+    xp1 = model_mean + model_std * noise * noise_std
+    x = safe_diffuser_guide_func(x, xp1, constraints, t)
+    return x, values   
 
 @torch.no_grad()
 def ddpm_sample_fn(

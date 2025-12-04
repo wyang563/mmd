@@ -5,6 +5,11 @@ Creates a random start/goal and 3 random conflict points as constraints.
 import os
 import torch
 import numpy as np
+import random
+
+# NOTES FOR MULTIAGENT TRAJECTORY GENERATION:
+# - Make sure conflict zones don't have sharp boundaries ie have a smooth continious area represent conflict zones
+# - Use masking along different points of the trajectory to reduce the number of conflict zones needed to solve for at time step t
 
 # Setup paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +55,7 @@ def create_random_start_goal(bounds=(-1.0, 1.0), seed=None):
     return start_pos, goal_pos
 
 
-def create_random_constraints_3d(num_constraints=3, num_timesteps=64, bounds=(-1.0, 1.0), seed=None):
+def create_random_constraints_3d(num_constraints=3, time_duration=10, num_timesteps=64, bounds=(-1.0, 1.0), seed=None):
     """
     Create random conflict points as a 3D list indexed by [timestep][point_idx][coord].
     
@@ -77,10 +82,11 @@ def create_random_constraints_3d(num_constraints=3, num_timesteps=64, bounds=(-1
     
     # Add each constraint point to its corresponding timestep
     for i in range(num_constraints):
-        t = int(timesteps[i])
+        t0 = int(timesteps[i])
         # Random position in bounds - this is the [x, y] coordinate
         point = ((np.random.rand(2) * 2 - 1) * scale + offset).tolist()
-        constraints_3d[t].append(point)  # point is [x, y]
+        for t in range(0, num_timesteps):
+            constraints_3d[t].append(point)  # point is [x, y]
     
     # Print the 3D structure
     print("\n=== Constraints as 3D list [timestep][point_idx][coord] ===")
@@ -100,11 +106,15 @@ def main():
     print("=" * 60)
     
     # Set random seed for reproducibility
-    seed = 68 
+    seed = random.randint(0, 1000000)
+    print(f"Seed: {seed}")
     
     # Use bounds within [-1, 1] since that's what the trained models expect
     # The user requested [-10, 10] but the models work in normalized coordinates
     bounds = (-0.95, 0.95)  # Slightly inside [-1, 1] to avoid boundary issues
+    constraint_time_duration = 20
+    num_constraints = 10
+    collision_radius = 0.15
     
     # Create random start and goal
     start_pos, goal_pos = create_random_start_goal(bounds=bounds, seed=seed)
@@ -114,12 +124,12 @@ def main():
     # Create 3 random conflict points as constraints
     num_timesteps = 64  # Standard trajectory length
     constraints_3d = create_random_constraints_3d(
-        num_constraints=3, 
+        num_constraints=num_constraints, 
+        time_duration=constraint_time_duration,
         num_timesteps=num_timesteps,
         bounds=bounds,
         seed=seed + 1
     )
-    print(f"\nConstraints: {constraints_3d}")
     
     # Model configuration
     model_id = 'EnvEmptyNoWait2D-RobotPlanarDisk'  # Use an empty environment for testing
@@ -131,7 +141,7 @@ def main():
     low_level_planner_model_args = {
         "start_state_pos": start_pos,
         "goal_state_pos": goal_pos,
-        "collision_radius": params.robot_planar_disk_radius * 2,
+        "collision_radius": collision_radius,
         "model_id": model_id,
         'planner_alg': 'mmd',
         'use_guide_on_extra_objects_only': params.use_guide_on_extra_objects_only,
@@ -225,7 +235,7 @@ def main():
             fps=10,
             figsize=(10, 10),
             agent_radius=params.robot_planar_disk_radius,
-            constraint_radius=params.robot_planar_disk_radius * 2,  # Constraint radius is 2x agent radius
+            constraint_radius=collision_radius,
             show_velocity_arrows=False,
             title="Single Agent Trajectory with Constraints",
             dpi=300
