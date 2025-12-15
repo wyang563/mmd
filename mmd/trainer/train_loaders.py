@@ -64,9 +64,9 @@ def get_dataset(dataset_class=None,
                 save_indices=False,
                 **kwargs):
     dataset_class = getattr(datasets, dataset_class)
-    print('\n---------------Loading data')
+    # print('\n---------------Loading data')
     full_dataset = dataset_class(dataset_subdir=dataset_subdir, **kwargs)
-    print(full_dataset)
+    # print(full_dataset)
 
     # split into train and validation
     train_subset, val_subset = random_split(full_dataset, [1-val_set_size, val_set_size])

@@ -27,10 +27,21 @@ device = get_torch_device(device)
 tensor_args = {'device': device, 'dtype': torch.float32}
 
 
-def create_random_start_goal(bounds=(-1.0, 1.0), seed=None):
+def create_random_start_goal(bounds=(-1.0, 1.0), seed=None, constraints_3d=None, constraint_radius=0.15):
     """
     Create random start and goal positions within bounds.
     Note: The trained models use a [-1, 1] coordinate system, not [-10, 10].
+    
+    Args:
+        bounds: Tuple of (min, max) bounds for positions
+        seed: Random seed for reproducibility
+        constraints_3d: 3D list of shape [num_timesteps][num_points_at_timestep][2]
+                       Format: constraints_3d[timestep][point_idx][coord] where coord is [x, y]
+        constraint_radius: Radius of constraint zones to avoid (default: 0.15)
+    
+    Returns:
+        start_pos: Start position tensor of shape [2]
+        goal_pos: Goal position tensor of shape [2]
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -40,22 +51,82 @@ def create_random_start_goal(bounds=(-1.0, 1.0), seed=None):
     scale = (bounds[1] - bounds[0]) / 2
     offset = (bounds[1] + bounds[0]) / 2
     
-    start_pos = torch.rand(2, **tensor_args) * 2 - 1  # Random in [-1, 1]
-    goal_pos = torch.rand(2, **tensor_args) * 2 - 1   # Random in [-1, 1]
+    max_tries = 1000
     
-    # Scale to the requested bounds
-    start_pos = start_pos * scale + offset
-    goal_pos = goal_pos * scale + offset
+    # Generate start position that avoids constraints at t=0
+    start_pos = None
+    if constraints_3d is not None and len(constraints_3d) > 0:
+        t0_constraints = constraints_3d[0]  # Constraints at time t=0
+        for _ in range(max_tries):
+            candidate_start = torch.rand(2, **tensor_args) * 2 - 1  # Random in [-1, 1]
+            candidate_start = candidate_start * scale + offset
+            
+            # Check if candidate is outside all constraint radii at t=0
+            is_valid = True
+            for constraint_point in t0_constraints:
+                constraint_pos = torch.tensor(constraint_point, **tensor_args)
+                distance = torch.norm(candidate_start - constraint_pos)
+                if distance < constraint_radius:
+                    is_valid = False
+                    break
+            
+            if is_valid:
+                start_pos = candidate_start
+                break
+        
+        # If we couldn't find a valid start position, use the last candidate
+        if start_pos is None:
+            print("WARNING: Could not find start position outside constraint radii at t=0, using last candidate")
+            start_pos = candidate_start
+    else:
+        # No constraints, generate normally
+        start_pos = torch.rand(2, **tensor_args) * 2 - 1  # Random in [-1, 1]
+        start_pos = start_pos * scale + offset
     
-    # Ensure start and goal are not too close
-    while torch.norm(start_pos - goal_pos) < 0.3:
-        goal_pos = torch.rand(2, **tensor_args) * 2 - 1
+    # Generate goal position that avoids constraints at t=H-1
+    goal_pos = None
+    if constraints_3d is not None and len(constraints_3d) > 0:
+        H = len(constraints_3d)
+        t_final_constraints = constraints_3d[H - 1]  # Constraints at time t=H-1 (last timestep)
+        for _ in range(max_tries):
+            candidate_goal = torch.rand(2, **tensor_args) * 2 - 1  # Random in [-1, 1]
+            candidate_goal = candidate_goal * scale + offset
+            
+            # Check if candidate is outside all constraint radii at t=H-1
+            is_valid = True
+            for constraint_point in t_final_constraints:
+                constraint_pos = torch.tensor(constraint_point, **tensor_args)
+                distance = torch.norm(candidate_goal - constraint_pos)
+                if distance < constraint_radius:
+                    is_valid = False
+                    break
+            
+            # Also ensure goal is not too close to start
+            if is_valid and torch.norm(candidate_goal - start_pos) < 0.3:
+                is_valid = False
+            
+            if is_valid:
+                goal_pos = candidate_goal
+                break
+        
+        # If we couldn't find a valid goal position, use the last candidate
+        if goal_pos is None:
+            print("WARNING: Could not find goal position outside constraint radii at t=H-1, using last candidate")
+            goal_pos = candidate_goal
+    else:
+        # No constraints, generate normally but ensure not too close to start
+        goal_pos = torch.rand(2, **tensor_args) * 2 - 1   # Random in [-1, 1]
         goal_pos = goal_pos * scale + offset
+        
+        # Ensure start and goal are not too close
+        while torch.norm(start_pos - goal_pos) < 0.3:
+            goal_pos = torch.rand(2, **tensor_args) * 2 - 1
+            goal_pos = goal_pos * scale + offset
     
     return start_pos, goal_pos
 
 
-def create_random_constraints_3d(num_constraints=3, time_duration=10, num_timesteps=64, bounds=(-1.0, 1.0), seed=None):
+def create_random_constraints_3d(num_constraints=3, collision_zone_time_duration=10, num_timesteps=64, bounds=(-1.0, 1.0), seed=None):
     """
     Create random conflict points as a 3D list indexed by [timestep][point_idx][coord].
     
@@ -82,20 +153,22 @@ def create_random_constraints_3d(num_constraints=3, time_duration=10, num_timest
     
     # Add each constraint point to its corresponding timestep
     for i in range(num_constraints):
-        t0 = int(timesteps[i])
+        t_s = int(timesteps[i])
+        t_e = min(t_s + collision_zone_time_duration, num_timesteps)
+
         # Random position in bounds - this is the [x, y] coordinate
         point = ((np.random.rand(2) * 2 - 1) * scale + offset).tolist()
-        for t in range(0, num_timesteps):
+        for t in range(t_s, t_e):
             constraints_3d[t].append(point)  # point is [x, y]
     
-    # Print the 3D structure
-    print("\n=== Constraints as 3D list [timestep][point_idx][coord] ===")
-    print(f"Total timesteps: {num_timesteps}")
-    for t in range(num_timesteps):
-        if len(constraints_3d[t]) > 0:
-            print(f"  Timestep {t}: {len(constraints_3d[t])} constraint(s)")
-            for p_idx, point in enumerate(constraints_3d[t]):
-                print(f"    Point {p_idx}: [{point[0]:.4f}, {point[1]:.4f}]")
+    # # Print the 3D structure
+    # print("\n=== Constraints as 3D list [timestep][point_idx][coord] ===")
+    # print(f"Total timesteps: {num_timesteps}")
+    # for t in range(num_timesteps):
+    #     if len(constraints_3d[t]) > 0:
+    #         print(f"  Timestep {t}: {len(constraints_3d[t])} constraint(s)")
+    #         for p_idx, point in enumerate(constraints_3d[t]):
+    #             print(f"    Point {p_idx}: [{point[0]:.4f}, {point[1]:.4f}]")
     
     return constraints_3d
 
@@ -112,24 +185,29 @@ def main():
     # Use bounds within [-1, 1] since that's what the trained models expect
     # The user requested [-10, 10] but the models work in normalized coordinates
     bounds = (-0.95, 0.95)  # Slightly inside [-1, 1] to avoid boundary issues
-    constraint_time_duration = 20
-    num_constraints = 10
-    collision_radius = 0.15
+    constraint_time_duration = 30
+    num_constraints = 0
+    collision_radius = 0.1
     
-    # Create random start and goal
-    start_pos, goal_pos = create_random_start_goal(bounds=bounds, seed=seed)
-    print(f"\nStart position: {start_pos}")
-    print(f"Goal position: {goal_pos}")
-    
-    # Create 3 random conflict points as constraints
+    # Create 3 random conflict points as constraints first
     num_timesteps = 64  # Standard trajectory length
     constraints_3d = create_random_constraints_3d(
         num_constraints=num_constraints, 
-        time_duration=constraint_time_duration,
+        collision_zone_time_duration=constraint_time_duration,
         num_timesteps=num_timesteps,
         bounds=bounds,
         seed=seed + 1
     )
+    
+    # Create random start and goal that avoid constraints at t=0 and t=H-1
+    start_pos, goal_pos = create_random_start_goal(
+        bounds=bounds, 
+        seed=seed,
+        constraints_3d=constraints_3d,
+        constraint_radius=collision_radius
+    )
+    print(f"\nStart position: {start_pos}")
+    print(f"Goal position: {goal_pos}")
     
     # Model configuration
     model_id = 'EnvEmptyNoWait2D-RobotPlanarDisk'  # Use an empty environment for testing

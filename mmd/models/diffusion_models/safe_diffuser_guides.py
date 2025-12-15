@@ -51,10 +51,11 @@ def invariance_time(
     else:
         t_single = float(t)
 
-    # Squeeze the leading 1-dim: [1, batch, horizon, state_dim] -> [batch, horizon, state_dim]
-    x = x.squeeze(0)
-    xp1 = xp1.squeeze(0)
-
+    # Handle both 3D [batch, horizon, state_dim] and 4D [1, batch, horizon, state_dim] inputs
+    if x.dim() == 4:
+        x = x.squeeze(0)
+        xp1 = xp1.squeeze(0)
+    
     nBatch, horizon, state_dim = x.shape
     device = x.device
 
@@ -83,7 +84,7 @@ def invariance_time(
 
     # If no constraints, just return the diffuser's suggestion.
     if len(constraint_points_by_timestep) == 0:
-        return xp1.unsqueeze(0)
+        return xp1
 
     # --- Time-varying γ(t) schedule ---
     # We assume t_single ∈ [0, num_diffusion_steps], where:
@@ -150,7 +151,7 @@ def invariance_time(
 
     # If somehow there are still no constraints after parsing, return xp1
     if len(G_rows) == 0:
-        return xp1.unsqueeze(0)
+        return xp1
 
     # Concatenate constraint rows
     # G: [batch, n_constraints, n_vars]

@@ -170,9 +170,8 @@ def create_trajectory_gif(
     def update(frame):
         # Update trajectory lines (show path up to current frame)
         for agent_idx in range(num_agents):
-            traj_x = trajectories[agent_idx, :frame+1, 0]
-            traj_y = trajectories[agent_idx, :frame+1, 1]
-            trajectory_lines[agent_idx].set_data(traj_x, traj_y)
+            # Set empty data to hide trailing lines - only show moving circles
+            trajectory_lines[agent_idx].set_data([], [])
             
             # Update agent position
             current_x = trajectories[agent_idx, frame, 0]
