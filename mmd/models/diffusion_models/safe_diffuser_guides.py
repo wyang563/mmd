@@ -9,7 +9,7 @@ def invariance_time(
     xp1,
     constraints,
     t,
-    constraint_radius: float = 0.15,
+    constraint_radius: float = 0.50,
     gamma_min: float = -0.5,          # how loose the spec is early in diffusion (negative)
     num_diffusion_steps: int = 1000,  # max diffusion step index (for scheduling)
     alpha_k: float = 1.0,             # CBF class-K gain

@@ -747,3 +747,366 @@ def create_single_agent_trajectory_gif_with_constraints(
     
     plt.close(fig)
     print(f"Single agent trajectory gif with constraints saved to: {output_path}")
+
+
+def create_masked_trajectory_timesteps_pdf(
+    trajectories,
+    starts,
+    goals,
+    agent_id: int,
+    mask,
+    output_path: str,
+    figsize: Tuple[int, int] = (36, 16),
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    title: Optional[str] = None
+) -> None:
+    """
+    Create a PDF plot with 3 subplots showing masked trajectories at different time intervals:
+    t/3, 2t/3, and full trajectory.
+    
+    The ego agent (agent_id) is highlighted in blue, agents in the mask are shown in red,
+    and agents not in the mask are shown in gray.
+    
+    Parameters
+    ----------
+    trajectories : np.ndarray or torch.Tensor
+        Trajectories array of shape (num_agents, time_steps, 4) where the last 
+        dimension consists of (px, py, vx, vy):
+        - px, py: x, y position
+        - vx, vy: x, y velocity
+    starts : np.ndarray or torch.Tensor
+        Start positions array of shape (num_agents, 2) where each row contains
+        (x, y) coordinates of the start position for each agent
+    goals : np.ndarray or torch.Tensor
+        Goal positions array of shape (num_agents, 2) where each row contains
+        (x, y) coordinates of the goal position for each agent
+    agent_id : int
+        The ID of the ego agent to highlight in blue
+    mask : list of np.ndarray or torch.Tensor
+        List of length time_steps, where each element is a binary mask array of shape 
+        (num_agents, num_agents). mask[t][i][j] indicates whether agent i can see agent j
+        at time step t (1 = visible/in mask, 0 = not visible).
+        Can also be a single np.ndarray or torch.Tensor of shape (time_steps, num_agents, num_agents).
+    output_path : str
+        Path to save the output PDF file
+    figsize : Tuple[int, int], optional
+        Figure size in inches, by default (36, 16)
+    xlim : Optional[Tuple[float, float]], optional
+        X-axis limits, by default None (auto-computed from data)
+    ylim : Optional[Tuple[float, float]], optional
+        Y-axis limits, by default None (auto-computed from data)
+    title : Optional[str], optional
+        Title for the plot, by default None
+    """
+    # Convert torch tensors to numpy arrays if needed
+    if hasattr(trajectories, 'cpu'):
+        trajectories = trajectories.cpu().detach().numpy()
+    elif not isinstance(trajectories, np.ndarray):
+        trajectories = np.array(trajectories)
+    
+    if hasattr(starts, 'cpu'):
+        starts = starts.cpu().detach().numpy()
+    elif not isinstance(starts, np.ndarray):
+        starts = np.array(starts)
+    
+    if hasattr(goals, 'cpu'):
+        goals = goals.cpu().detach().numpy()
+    elif not isinstance(goals, np.ndarray):
+        goals = np.array(goals)
+    
+    num_agents, time_steps, _ = trajectories.shape
+    
+    # Handle mask input - convert list of tensors to numpy array
+    if isinstance(mask, list):
+        # List of tensors/arrays, each of shape (num_agents, num_agents)
+        mask_list = []
+        for m in mask:
+            if hasattr(m, 'cpu'):
+                mask_list.append(m.cpu().detach().numpy())
+            elif isinstance(m, np.ndarray):
+                mask_list.append(m)
+            else:
+                mask_list.append(np.array(m))
+        # Stack into shape (time_steps, num_agents, num_agents)
+        mask_array = np.stack(mask_list, axis=0)
+    else:
+        # Single array or tensor
+        if hasattr(mask, 'cpu'):
+            mask_array = mask.cpu().detach().numpy()
+        elif isinstance(mask, np.ndarray):
+            mask_array = mask
+        else:
+            mask_array = np.array(mask)
+    
+    # Extract mask for the specified agent_id
+    # mask_array shape: (time_steps, num_agents, num_agents)
+    # mask_array[t, agent_id, :] gives which agents are visible to agent_id at time t
+    if mask_array.ndim != 3:
+        raise ValueError(f"Unexpected mask shape: {mask_array.shape}. Expected (time_steps, num_agents, num_agents)")
+    
+    if mask_array.shape[0] != time_steps:
+        raise ValueError(f"Mask time dimension {mask_array.shape[0]} does not match trajectories time dimension {time_steps}")
+    
+    if mask_array.shape[1] != num_agents or mask_array.shape[2] != num_agents:
+        raise ValueError(f"Mask agent dimensions {mask_array.shape[1:]}, do not match number of agents {num_agents}")
+    
+    # Extract the mask for the ego agent: shape (time_steps, num_agents)
+    agent_mask = mask_array[:, agent_id, :]
+    
+    # Extract position data (first 2 columns)
+    positions = trajectories[:, :, :2]  # Shape: (num_agents, time_steps, 2)
+    
+    # Auto-calculate axis limits if not provided
+    if xlim is None or ylim is None:
+        all_x = np.concatenate([
+            positions[:, :, 0].flatten(),
+            goals[:, 0],
+            starts[:, 0]
+        ])
+        all_y = np.concatenate([
+            positions[:, :, 1].flatten(),
+            goals[:, 1],
+            starts[:, 1]
+        ])
+        
+        x_min, x_max = all_x.min(), all_x.max()
+        y_min, y_max = all_y.min(), all_y.max()
+        
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        
+        x_padding = max(0.15 * x_range, 0.5)
+        y_padding = max(0.15 * y_range, 0.5)
+        
+        if xlim is None:
+            xlim = (x_min - x_padding, x_max + x_padding)
+        if ylim is None:
+            ylim = (y_min - y_padding, y_max + y_padding)
+    
+    # Color scheme
+    ego_color = 'darkblue'
+    masked_color = 'red'
+    unmasked_color = 'gray'
+    
+    # Create figure with 1x3 grid
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    
+    # Layout: margins & spacing
+    pad_inches = 0.5
+    left_margin = pad_inches / figsize[0]
+    right_margin = 1.0 - pad_inches / figsize[0]
+    bottom_margin = pad_inches / figsize[1]
+    top_margin = 1.0 - pad_inches / figsize[1]
+    
+    available_width = figsize[0] - 2 * pad_inches
+    subplot_width = available_width / 3
+    wspace = pad_inches / subplot_width
+    
+    plt.subplots_adjust(
+        left=left_margin,
+        right=right_margin,
+        top=top_margin,
+        bottom=bottom_margin,
+        wspace=wspace,
+    )
+    
+    # Time step indices for t/3, 2t/3, full
+    time_indices = []
+    for i in range(1, 4):
+        t_idx = int(i * time_steps / 3)
+        t_idx = min(t_idx, time_steps - 1)
+        time_indices.append(t_idx)
+    
+    # --- Draw each subplot ---
+    for plot_idx, t_end in enumerate(time_indices):
+        ax = axes[plot_idx]
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        
+        # Anchor axes at the bottom so they don't float to the vertical center
+        ax.set_aspect('equal', adjustable='box', anchor='S')
+        ax.grid(True, alpha=0.3)
+        
+        # Titles
+        if plot_idx == 2:
+            subplot_title = "Full Trajectory"
+        else:
+            subplot_title = f"t = {t_end + 1}"
+        ax.set_title(subplot_title, fontsize=32, fontweight='bold')
+        
+        ax.set_xlabel('X Position', fontsize=28)
+        if plot_idx == 0:
+            ax.set_ylabel('Y Position', fontsize=28)
+        
+        # Remove numeric tick labels (keep grid only)
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        
+        # Get mask for current frame
+        current_mask = agent_mask[t_end, :]  # Shape: (num_agents,)
+        
+        # Ego trajectory
+        ego_traj = positions[agent_id, :t_end+1, :]
+        if len(ego_traj) > 1:
+            ax.plot(
+                ego_traj[:, 0],
+                ego_traj[:, 1],
+                '-',
+                color=ego_color,
+                alpha=0.9,
+                linewidth=6.0,
+                label='Ego Agent',
+            )
+        
+        # Other agents' trajectories
+        for i in range(num_agents):
+            if i == agent_id:
+                continue
+            
+            agent_traj = positions[i, :t_end+1, :]
+            if len(agent_traj) <= 1:
+                continue
+            
+            is_masked = bool(current_mask[i])
+            color = masked_color if is_masked else unmasked_color
+            alpha = 0.8 if is_masked else 0.5
+            linewidth = 5.0 if is_masked else 3.0
+            
+            ax.plot(
+                agent_traj[:, 0],
+                agent_traj[:, 1],
+                '-',
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
+            )
+        
+        # Current positions
+        for i in range(num_agents):
+            current_pos = positions[i, t_end, :]
+            
+            if i == agent_id:
+                ax.scatter(
+                    current_pos[0],
+                    current_pos[1],
+                    color=ego_color,
+                    s=400,
+                    marker='o',
+                    alpha=0.9,
+                    edgecolors='black',
+                    linewidth=3,
+                    zorder=5,
+                )
+            else:
+                is_masked = bool(current_mask[i])
+                color = masked_color if is_masked else unmasked_color
+                ax.scatter(
+                    current_pos[0],
+                    current_pos[1],
+                    color=color,
+                    s=350,
+                    marker='o',
+                    alpha=0.8,
+                    edgecolors='black',
+                    linewidth=2.5,
+                    zorder=5,
+                )
+            
+            ax.text(
+                current_pos[0],
+                current_pos[1],
+                f' {i}',
+                fontsize=24,
+                ha='left',
+                va='bottom',
+                zorder=6,
+            )
+        
+        # Goals
+        for i in range(num_agents):
+            if i == agent_id:
+                ax.scatter(
+                    goals[i, 0],
+                    goals[i, 1],
+                    color=ego_color,
+                    s=800,
+                    marker='*',
+                    edgecolors='black',
+                    linewidth=3,
+                    alpha=0.8,
+                    zorder=5,
+                )
+            else:
+                is_masked = bool(current_mask[i])
+                goal_color = masked_color if is_masked else unmasked_color
+                ax.scatter(
+                    goals[i, 0],
+                    goals[i, 1],
+                    color=goal_color,
+                    s=600,
+                    marker='*',
+                    edgecolors='black',
+                    linewidth=2.5,
+                    alpha=0.6,
+                    zorder=5,
+                )
+    
+    # --- Legend: place just above the middle axes, in axes coords ---
+    legend_elements = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='w',
+            markerfacecolor=ego_color,
+            markersize=24,
+            markeredgecolor='black',
+            markeredgewidth=3,
+            label='Ego Agent',
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='w',
+            markerfacecolor=masked_color,
+            markersize=20,
+            markeredgecolor='black',
+            markeredgewidth=2.5,
+            label='Included Agent(s)',
+        ),
+        plt.Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='w',
+            markerfacecolor=unmasked_color,
+            markersize=20,
+            markeredgecolor='black',
+            markeredgewidth=2.5,
+            label='Excluded Agent(s)',
+        ),
+    ]
+    
+    # Use the center subplot as reference for axes coordinates
+    anchor_ax = axes[1] if len(axes) > 1 else axes[0]
+    
+    fig.legend(
+        handles=legend_elements,
+        loc='lower center',
+        fontsize=32,
+        framealpha=0.9,
+        ncol=3,
+        bbox_to_anchor=(0.5, 1.08),
+        bbox_transform=anchor_ax.transAxes,
+    )
+    
+    # Add overall title if provided
+    if title:
+        fig.suptitle(title, fontsize=36, fontweight='bold', y=0.98)
+    
+    print(f"Saving PDF to: {output_path}")
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', pad_inches=0, format='pdf')
+    plt.close(fig)
+    print("✓ PDF created successfully!")

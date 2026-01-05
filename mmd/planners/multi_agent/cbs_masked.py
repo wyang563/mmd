@@ -24,6 +24,7 @@ SOFTWARE.
 # Standard imports.
 import os
 import time
+import warnings
 from math import floor, ceil
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -155,11 +156,15 @@ class CBSMasked:
         if not is_multi_agent_start_goal_states_valid(self.reference_robot,
                                                       self.reference_task,
                                                       self.start_state_pos_l,
-                                                      self.goal_state_pos_l):
-            print(RED + 'Start or goal states are invalid.')
+                                                      self.goal_state_pos_l,
+                                                      is_enforce_min_dist=False):  # Skip distance check since we already did it
+            print(RED + 'Start or goal states are invalid (collisions detected).')
             print(self.start_state_pos_l)
             print(self.goal_state_pos_l, RESET)
-            raise ValueError('Start or goal states are invalid.')
+            warnings.warn(
+                'Start or goal states have collisions. Continuing execution, but this may cause planning issues.',
+                UserWarning
+            )
         # Open list.
         self.open_l = []
         # Agent mask for collision detection (will be set in plan method)

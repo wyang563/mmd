@@ -69,7 +69,7 @@ from mmd.config.mmd_params import MMDParams as params
 from mmd.common.experiments import MultiAgentPlanningSingleTrialConfig, MultiAgentPlanningSingleTrialResult, \
     get_result_dir_from_trial_config, TrialSuccessStatus
 from torch_robotics.environments import *
-from mmd.utils.plot_trajs import create_trajectory_gif, create_masked_trajectory_gif
+from mmd.utils.plot_trajs import create_trajectory_gif, create_masked_trajectory_gif, create_masked_trajectory_timesteps_pdf
 from typing import Any
 import jax.numpy as jnp
 import numpy as np
@@ -389,7 +389,6 @@ def run_horizon_step(
             skeleton_model_coord[1]]
     reference_agent_model_ids = [reference_agent_model_ids[i] for i in range(len(reference_agent_model_ids))]
     # Create the reference low level planner.
-    print("Creating reference agent stuff.")
     low_level_planner_model_args['start_state_pos'] = torch.tensor([0.5, 0.9], **tensor_args)  # This does not matter.
     low_level_planner_model_args['goal_state_pos'] = torch.tensor([-0.5, 0.9], **tensor_args)  # This does not matter.
     low_level_planner_model_args['model_ids'] = reference_agent_model_ids  # This matters.
@@ -566,6 +565,7 @@ def run_multi_agent_trial(
         stride: int = 1,
         model_past_horizon: int = 10,
         model_path: str = None,
+        save_results: bool = False,
     ):
     final_planner = create_whole_trajectory_planner(test_config)
 
@@ -739,26 +739,30 @@ def run_multi_agent_trial(
     # ============================
     # Create a results directory.
     # ============================
-    results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
-    os.makedirs(results_dir, exist_ok=True)
-    exp_name = 'mmd_horizon_based_trial'
+    if save_results:
+        results_dir = get_result_dir_from_trial_config(test_config, test_config.time_str, test_config.trial_number)
+        os.makedirs(results_dir, exist_ok=True)
+        exp_name = 'mmd_horizon_based_trial'
 
-    if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
-        print(f"\n{CYAN}Rendering trajectories...{RESET}")
-        plot_starts = torch.stack(start_l)
-        plot_goals = torch.stack(goal_l)
-        plot_trajs = torch.stack(final_trajectories)
-        create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
-        if model is not None:
-            create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
-            final_planner.render_paths_masked(final_trajectories, 0, sim_masks, output_fpath=os.path.join(results_dir, f'{exp_name}_planner_visualization_masked.gif'), plot_trajs=True, animation_duration=10)
+        if final_success_status == TrialSuccessStatus.SUCCESS and len(final_trajectories) > 0 and all(t is not None for t in final_trajectories):
+            print(f"\n{CYAN}Rendering trajectories...{RESET}")
+            plot_starts = torch.stack(start_l)
+            plot_goals = torch.stack(goal_l)
+            plot_trajs = torch.stack(final_trajectories)
+            create_trajectory_gif(plot_trajs, plot_starts, plot_goals, os.path.join(results_dir, f'{exp_name}.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+            if model is not None:
+                create_masked_trajectory_gif(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked.gif'), fps=10, figsize=(10, 10), show_velocity_arrows=False, dpi=300)
+                create_masked_trajectory_timesteps_pdf(plot_trajs, plot_starts, plot_goals, 0, sim_masks, os.path.join(results_dir, f'{exp_name}_masked_timesteps.pdf'), figsize=(36, 16))
+                final_planner.render_paths_masked(final_trajectories, 0, sim_masks, output_fpath=os.path.join(results_dir, f'{exp_name}_planner_visualization_masked.gif'), plot_trajs=True, animation_duration=10)
 
-    else:
-        print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
+        else:
+            print(f"{YELLOW}Skipping rendering due to planning failure or empty trajectories{RESET}")
+    
+    return final_trajectories, sim_masks, total_planning_time
 
 if __name__ == '__main__':
     test_config_single_tile = MultiAgentPlanningSingleTrialConfig()
-    test_config_single_tile.num_agents = 5 
+    test_config_single_tile.num_agents = 20 
     test_config_single_tile.instance_name = "test"
     test_config_single_tile.multi_agent_planner_class = "XECBS"  # Or "ECBS" or "XCBS" or "CBS" or "PP".
     test_config_single_tile.single_agent_planner_class = "MPDEnsemble"  # Or "MPD"
@@ -767,9 +771,9 @@ if __name__ == '__main__':
     test_config_single_tile.time_str = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     test_config_single_tile.render_animation = True  # Change the `densify_trajs` call above to create nicer animations.
     
-    player_selection_model_path = "/home/alex/gnn_game_planning/log/point_agent_train_runs/gnn_full_MP_2_edge-metric_full_top-k_5/train_n_agents_10_T_50_obs_10_lr_0.0003_bs_32_sigma1_0.11_sigma2_0.11_epochs_50_loss_type_similarity/20251108_103120/psn_best_model.pkl"
+    player_selection_model_path = "/home/alex/gnn_game_planning/best_models/point_agent/gnn_full_MP_2_edge-metric_barrier-function_top-k_5/train_n_agents_20_T_50_obs_10_lr_0.0001_bs_32_sigma1_0.63_sigma2_0.63_sigma3_0.063_noise_std_0.5_epochs_20_loss_type_ego_agent_cost/20251231_015734/psn_best_model.pkl"
     # player_selection_model_path = None
-    stride = 4
+    stride = 16 
 
     example_type = "single_tile"
     # example_type = "multi_tile"
@@ -786,7 +790,7 @@ if __name__ == '__main__':
 
         # Choose starts and goals.
         test_config_single_tile.agent_skeleton_l = [[[0, 0]]] * test_config_single_tile.num_agents
-        torch.random.manual_seed(43)
+        # torch.random.manual_seed(16)
         test_config_single_tile.start_state_pos_l, test_config_single_tile.goal_state_pos_l = \
         get_start_goal_pos_random_in_env(test_config_single_tile.num_agents,
                                          EnvDropRegion2D,
@@ -812,7 +816,7 @@ if __name__ == '__main__':
         print("Starts:", test_config_single_tile.start_state_pos_l)
         print("Goals:", test_config_single_tile.goal_state_pos_l)
 
-        run_multi_agent_trial(test_config_single_tile, stride=stride, model_path=player_selection_model_path)
+        run_multi_agent_trial(test_config_single_tile, stride=stride, model_path=player_selection_model_path, save_results=True)
         print(GREEN, 'OK.', RESET)
 
     # ============================

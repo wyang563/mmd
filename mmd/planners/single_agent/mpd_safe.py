@@ -101,9 +101,9 @@ class MPDSafe(SingleAgentPlanner):
         device = get_torch_device(device)
         tensor_args = {'device': device, 'dtype': torch.float32}
         ####################################
-        print(f'####################################')
-        print(f'Initializing Planner with Model -- {model_id}')
-        print(f'Algorithm -- {planner_alg}')
+        # print(f'####################################')
+        # print(f'Initializing Planner with Model -- {model_id}')
+        # print(f'Algorithm -- {planner_alg}')
         run_prior_only = False
         run_prior_then_guidance = False
         if planner_alg == 'mmd':
@@ -182,8 +182,9 @@ class MPDSafe(SingleAgentPlanner):
         ####################################
         # If the args specify a test start and goal, use those.
         if start_state_pos is not None and goal_state_pos is not None:
-            print(f'start_state_pos: {start_state_pos}')
-            print(f'goal_state_pos: {goal_state_pos}')
+            pass
+            # print(f'start_state_pos: {start_state_pos}')
+            # print(f'goal_state_pos: {goal_state_pos}')
         else:
             # Random initial and final positions
             n_tries = 100
@@ -201,8 +202,8 @@ class MPDSafe(SingleAgentPlanner):
                              f"start_state_pos: {start_state_pos}\n"
                              f"goal_state_pos:  {goal_state_pos}\n")
 
-        print(f'start_state_pos: {start_state_pos}')
-        print(f'goal_state_pos: {goal_state_pos}')
+        # print(f'start_state_pos: {start_state_pos}')
+        # print(f'goal_state_pos: {goal_state_pos}')
 
         ####################################
         # Run motion planning inference

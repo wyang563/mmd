@@ -2,8 +2,8 @@ import os
 import torch
 import numpy as np
 import random
-import copy
-import heapq
+import time
+import csv
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -114,13 +114,18 @@ def generate_safe_start_goal_positions(n_agents, bounds=(-1.0, 1.0), seed=None, 
 
 
 # DECENTRALIZED CBS PLANNER
-
 if __name__ == "__main__":
     model_id = 'EnvEmptyNoWait2D-RobotPlanarDisk'  # Use an empty environment for testing
     num_timesteps = 64
-    num_agents = 15 
-    start_l, goal_l = generate_safe_start_goal_positions(n_agents=num_agents)
-    trajectories = decentralized_planner(start_l, goal_l, collision_radius=0.1, model_id=model_id, num_timesteps=num_timesteps)
+    num_agents = 2 
+    # start_l, goal_l = generate_safe_start_goal_positions(n_agents=num_agents)
+    start_l = [torch.tensor([-1.0, -1.0], **tensor_args), torch.tensor([1.0, 1.0], **tensor_args)]
+    goal_l = [torch.tensor([1.0, 1.0], **tensor_args), torch.tensor([-1.0, -1.0], **tensor_args)]
+    # trajectories = centralized_planner(start_l, goal_l, collision_radius=0.3, model_id=model_id, num_timesteps=num_timesteps)
+    time_start = time.time()
+    trajectories = decentralized_planner(start_l, goal_l, collision_radius=0.1, model_id=model_id, num_timesteps=num_timesteps, t_past=3)
+    time_end = time.time()
+    print(f"Planning time taken: {time_end - time_start} seconds")
 
     # Plot trajectories
     print("\n" + "=" * 60)
@@ -141,7 +146,9 @@ if __name__ == "__main__":
     os.makedirs(LOGS_DIR, exist_ok=True)
     
     # Save trajectory gif
-    output_path = os.path.join(LOGS_DIR, 'multi_agent_trajectory.gif')
+    out_dir = os.path.join(LOGS_DIR, 'multi_agent_trajectory', time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, 'multi_agent_trajectory.gif')
     create_trajectory_gif(
         trajectories=trajectories_array,
         starts=starts_array,
@@ -156,6 +163,32 @@ if __name__ == "__main__":
     )
     
     print(f"\nGIF saved to: {output_path}")
+    
+    # Save trajectory data to CSV
+    csv_path = os.path.join(out_dir, 'trajectories.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        # Write header
+        writer.writerow(['agent_id', 'timestep', 'x', 'y', 'vx', 'vy', 'is_start', 'is_goal'])
+        
+        # Write start positions (timestep = -1)
+        for agent_id in range(num_agents):
+            x, y = starts_array[agent_id]
+            writer.writerow([agent_id, -1, x, y, 0.0, 0.0, True, False])
+        
+        # Write trajectory data
+        num_agents_csv, num_timesteps_csv, state_dim = trajectories_array.shape
+        for agent_id in range(num_agents_csv):
+            for timestep in range(num_timesteps_csv):
+                x, y, vx, vy = trajectories_array[agent_id, timestep, :]
+                writer.writerow([agent_id, timestep, x, y, vx, vy, False, False])
+        
+        # Write goal positions (timestep = num_timesteps)
+        for agent_id in range(num_agents):
+            x, y = goals_array[agent_id]
+            writer.writerow([agent_id, num_timesteps, x, y, 0.0, 0.0, False, True])
+    
+    print(f"Trajectory CSV saved to: {csv_path}")
 
 
 
